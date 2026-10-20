@@ -2,6 +2,11 @@
 
 `linf` emits four lanes (RFC §3), all on stderr. Pick the one your host
 consumes; the contract JSONL lane is what programmatic consumers parse.
+Each input's compiler stream must end in exactly one valid summary. Malformed
+streams fail with a `linf:plumbing` diagnostic (exit 2); valid unknown kinds are
+forwarded verbatim only in `contract`. Never infer success from missing output.
+The 65,536 stored-diagnostic ceiling is also an explicit incomplete-results
+plumbing failure, including in SARIF; consumers must check the process exit.
 
 ## VS Code — works today, no extension required
 

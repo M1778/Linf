@@ -40,11 +40,16 @@ forks a second lexer.** Linf builds on the machine contract the way `finn` build
    summary** whose `errors`/`warnings` count the whole pass-through stream and
    whose `exitCode` is Linf's own. Existing JSON-diagnostic consumers can read
    Linf's output without knowing Linf.
-   Field extraction (non-contract lanes) is key-anchored over the raw bytes
-   (`"severity"`, `"message"`, `"file"`, `"line"`, `"column"`,
-   `"exitCode"`, `"errors"`, `"warnings"`), unescaping through json.fin's
-   `json_decode_str` — contract shapes today, no general JSON reader; a
-   nested-object key addition would move linf to a real read pass.
+   Field extraction is bounded to one JSONL record and reads only top-level
+   contract fields. Nested additive fields are validated and skipped, nullable
+   locations stay locationless, and escaped strings (including Unicode) decode
+   independently. Each invocation requires exactly one valid trailing summary;
+   malformed, duplicate, missing, or nonterminal summaries are plumbing failures.
+   Unknown valid kinds still forward verbatim in the contract lane. The parser
+   rejects nesting beyond 128 levels and decoded NUL (Fin strings cannot carry it).
+   Stored diagnostics grow geometrically to 65,536; exceeding that resource ceiling
+   reserves an explicit incomplete-results plumbing diagnostic and exit 2. Runtime
+   allocation failure itself is not recoverable with the current Fin allocator.
 
 ## 2. Rule facts: where they come from
 

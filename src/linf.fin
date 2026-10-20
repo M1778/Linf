@@ -10,29 +10,31 @@
 // because finc's stdout is contract-silent for every non-reserved flag, which
 // is exactly what this invocation uses.
 //
-// Output (RFC §3): the contract shape by default; `--format=gcc` one-liners
-// (VS Code `problemMatcher: "$gcc"`, Neovim errorformat); `--format=actions`
-// workflow annotations; `--format=sarif` 2.1.0 (code scanning, SARIF viewers).
-// Line/SARIF renderings come from key-anchored extractions; the contract
-// format forwards finc's lines VERBATIM — still contract-tolerant of unknown
-// kinds — and renders only linf's own additions (RFC §2 records the split).
+// Output (RFC §3): the contract shape by default; `--format gcc` one-liners
+// (VS Code `problemMatcher: "$gcc"`, Neovim errorformat); `--format actions`
+// workflow annotations; `--format sarif` 2.1.0 (code scanning, SARIF viewers).
+// Line/SARIF renderings come from bounded top-level JSON fields; the contract
+// format forwards valid finc records VERBATIM, including unknown kinds.
+// Malformed records fail as plumbing without contaminating the output JSONL.
 //
 // Exit codes (RFC §3): 0 clean, 1 findings (or sources finc rejected, passed
 // through), 2 usage/IO/plumbing (including a missing summary), 3 propagate a
 // finc failure. linf's own failures are emitted as contract JSONL too.
 //
-// shortcut: findings pool is capped at 256 per run and imported names at 32
-// per file, both static — loud linf-owned limits, upgrade on demand.
+// Findings grow geometrically to 65536; the ceiling has a reserved plumbing
+// diagnostic outside the pool. Import tracking is bounded by the token count.
 
 import { read_to_string, free_file_content } from fs::std;
 import { ProcessResult, exec_command, free_process_result } from process::std;
 import { Command, Match, Outcome, free_match } from cli::std;
 import { CdkTokens, cdk_scan, free_cdk_tokens } from cdk::std;
 import { tok_ident, tok_semicolon, tok_lbracket, tok_rbracket, tok_rparen,
+      tok_lbrace, tok_rbrace, tok_comma, tok_dot, tok_double_colon, kw_as,
       tok_int_lit, tok_float_lit, tok_string_lit, tok_char_lit,
       kw_import, kw_from, kw_new, kw_delete, kw_blame } from token::std;
+import { Buffer, new_buffer, free_buffer } from buffer::std;
 import { len, to_chars, from_chars, equals, concat, clone, free_str } from strings::std;
-import { json_encode_str, json_decode_str } from json::std;
+import { json_decode_str } from json::std;
 import { cli_dprintf } from cli::std;
 
 // A finding in the contract's field set, renderer-agnostic: linf-owned
@@ -47,57 +49,75 @@ priv struct Fnd {
     pub col <int> = 1,
 }
 
-// The whole run's state: the finding pool plus the counters the final
-// summary needs. finc tallies come from its parsed summary lines; linf's own
-// are tracked at add time, split by severity for the totals.
+// A reserved diagnostic is independent of the heap pool, so a deliberate
+// resource ceiling cannot silently swallow a plumbing failure. Fin's `new`
+// has no recoverable OOM path; allocation failure remains a runtime limit.
 priv struct Run {
     pub fnds <[Fnd]>,
+    pub capacity <int> = 256,
     pub count <int> = 0,
-    pub linf_count <int> = 0,      // findings linf itself owns (code != "")
-    pub linf_errors <int> = 0,     // of those, severity error+
+    pub exhausted <bool> = false,
+    pub emergency <Fnd> = Fnd{sev: 2, code: "linf:plumbing",
+          message: "diagnostic limit (65536) reached; findings are incomplete", file: "", line: 0, col: 0},
+    pub linf_count <int> = 0,
+    pub linf_errors <int> = 0,
     pub finc_errors <int> = 0,
     pub finc_warnings <int> = 0,
-    pub saw_summary <int> = 0,
-    pub linf_exit <int> = 0,       // starts clean; worsens per the mirror
+    pub linf_exit <int> = 0,
 
     pub static fun create() <Run> {
         let pool <[Fnd]> = new [Fnd, 256]{};
-        let r <Run> = Run{fnds: pool, count: 0, linf_count: 0, linf_errors: 0,
-              finc_errors: 0, finc_warnings: 0, saw_summary: 0, linf_exit: 0};
-        return r;
+        return Run{fnds: pool};
     }
 
-    // Adds one finding. Strings are COPIED here (strings.fin clone), so
-    // callers may hand literals or extractor temporaries; both frees stay
-    // well-defined.
+    pub fun allocation_failed(self: &Self) <noret> {
+        if (!self.exhausted) {
+            self.exhausted = true;
+            self.linf_count++;
+            self.linf_errors++;
+        }
+        self.worsen(2);
+    }
+
     pub fun add(self: &Self, sev: int, code: string, message: string,
                 file: string, line: int, col: int) <noret> {
-        if (self.count >= 256) { return; }
+        if (self.exhausted) { return; }
+        if (self.count == self.capacity) {
+            if (self.capacity >= 65536) { self.allocation_failed(); return; }
+            let cap <int> = self.capacity * 2;
+            let pool <[Fnd]> = new [Fnd, cap]{};
+            for (let i <int> = 0; i < self.count; i++) { pool[i] = self.fnds[i]; }
+            delete self.fnds;
+            self.fnds = pool;
+            self.capacity = cap;
+        }
         let f <Fnd> = Fnd{sev: sev,
               code: clone(code), message: clone(message), file: clone(file),
               line: line, col: col};
         self.fnds[self.count] = f;
-        self.count = self.count + 1;
+        self.count++;
         if (!equals(code, "")) {
-            self.linf_count = self.linf_count + 1;
-            if (sev >= 2) { self.linf_errors = self.linf_errors + 1; }
+            self.linf_count++;
+            if (sev >= 2) { self.linf_errors++; }
         }
     }
 
-    // Worsens the run's exit per RFC §3's mirror. Nonstandard codes (raw
-    // shell signals like 127, or waitstatus debris) rank at 2, the plumbing
-    // plane; a real finc 3 always wins, 2 never swallows it.
+    pub fun size(self: &Self) <int> {
+        if (self.exhausted) { return self.count + 1; }
+        return self.count;
+    }
+
+    pub fun at(self: &Self, i: int) <&Fnd> {
+        if (i == self.count) { return &self.emergency; }
+        return &self.fnds[i];
+    }
+
+    // Compiler failure outranks plumbing; source rejection never hides either.
     pub fun worsen(self: &Self, code: int) <noret> {
         if (code <= 0) { return; }
         let rank <int> = code;
         if (rank > 3) { rank = 2; }
-        if (rank == 3) {
-            self.linf_exit = 3;
-            return;
-        }
-        if (rank > self.linf_exit) {
-            self.linf_exit = rank;
-        }
+        if (rank > self.linf_exit) { self.linf_exit = rank; }
     }
 }
 
@@ -117,146 +137,433 @@ priv fun sev_map(sev_text: string) <int> {
     return 2;
 }
 
-// ---- JSONL field extraction (RFC §2 source 3: bounded key-anchored reads) --
+// ---- bounded JSON records -------------------------------------------------
+// This reads JSON, not Fin source. Unknown fields are structurally skipped;
+// only top-level contract fields are interpreted. Every cursor stays inside
+// one line, so earlier diagnostics and nested keys cannot shadow this record.
+priv struct JsonRecord {
+    pub bytes <[char]>,
+    pub pos <int> = 0,
+    pub end <int> = 0,
+    pub valid <bool> = true,
 
-// Index of `key` inside bytes[0..end), or -1. Keys are literals so the
-// compare is a char walk; nothing is allocated.
-priv fun find_in(b: [char], end: int, key: string) <int> {
-    let kc <[char]> = to_chars(key);
-    let klen <int> = len(key);
-    let i <int> = 0;
-    while (i + klen <= end) {
-        let j <int> = 0;
-        let hit <int> = 1;
-        while (j < klen) {
-            if (b[i + j] != kc[j]) {
-                hit = 0;
-                j = klen;
-            } else {
-                j = j + 1;
-            }
+    pub fun ws(self: &Self) <noret> {
+        while (self.pos < self.end) {
+            let c <char> = self.bytes[self.pos];
+            if (c != ' ' && c != '\t' && c != '\r') { break; }
+            self.pos++;
         }
-        if (hit == 1) {
-            delete kc;
-            return i;
-        }
-        i = i + 1;
     }
-    delete kc;
+
+    pub fun take(self: &Self, c: char) <bool> {
+        self.ws();
+        if (self.pos >= self.end || self.bytes[self.pos] != c) { return false; }
+        self.pos++;
+        return true;
+    }
+
+    pub fun hex4(self: &Self) <int> {
+        let v <int> = 0;
+        for (let j <int> = 0; j < 4; j++) {
+            if (self.pos >= self.end) { self.valid = false; return 0; }
+            let c <char> = self.bytes[self.pos];
+            self.pos++;
+            let h <int> = -1;
+            if (c >= '0' && c <= '9') { h = c - '0'; }
+            if (c >= 'a' && c <= 'f') { h = c - 'a' + 10; }
+            if (c >= 'A' && c <= 'F') { h = c - 'A' + 10; }
+            if (h < 0) { self.valid = false; return 0; }
+            v = v * 16 + h;
+        }
+        return v;
+    }
+
+    // Decode once, including Unicode escapes (the SDK scalar decoder only
+    // accepts ASCII). NUL cannot be represented in Fin's C strings: refuse it
+    // explicitly rather than silently truncate a message, key or path.
+    pub fun string_value(self: &Self) <string> {
+        if (!self.take('"')) { self.valid = false; return clone(""); }
+        let out <Buffer> = new_buffer(32);
+        let closed <bool> = false;
+        while (self.pos < self.end && self.valid) {
+            let c <char> = self.bytes[self.pos];
+            self.pos++;
+            if (c == '"') { closed = true; break; }
+            if (cast<int>(c) >= 0 && cast<int>(c) < 32) { self.valid = false; break; }
+            if (c != '\\') { out.write_char(c); continue; }
+            if (self.pos >= self.end) { self.valid = false; break; }
+            let e <char> = self.bytes[self.pos];
+            self.pos++;
+            if (e == '"' || e == '\\' || e == '/') { out.write_char(e); }
+            else if (e == 'n') { out.write_char('\n'); }
+            else if (e == 'r') { out.write_char('\r'); }
+            else if (e == 't') { out.write_char('\t'); }
+            else if (e == 'b') { out.write_char(cast<char>(8)); }
+            else if (e == 'f') { out.write_char(cast<char>(12)); }
+            else if (e == 'u') {
+                let cp <int> = self.hex4();
+                if (cp >= 55296 && cp <= 56319) {
+                    if (self.pos + 2 > self.end || self.bytes[self.pos] != '\\'
+                        || self.bytes[self.pos + 1] != 'u') { self.valid = false; break; }
+                    self.pos += 2;
+                    let low <int> = self.hex4();
+                    if (low < 56320 || low > 57343) { self.valid = false; break; }
+                    cp = 65536 + (cp - 55296) * 1024 + low - 56320;
+                } else if (cp >= 56320 && cp <= 57343) { self.valid = false; break; }
+                if (cp == 0) { self.valid = false; break; }
+                if (cp < 128) { out.write_char(cast<char>(cp)); }
+                else if (cp < 2048) {
+                    out.write_char(cast<char>(192 + cp / 64));
+                    out.write_char(cast<char>(128 + cp % 64));
+                } else if (cp < 65536) {
+                    out.write_char(cast<char>(224 + cp / 4096));
+                    out.write_char(cast<char>(128 + cp / 64 % 64));
+                    out.write_char(cast<char>(128 + cp % 64));
+                } else {
+                    out.write_char(cast<char>(240 + cp / 262144));
+                    out.write_char(cast<char>(128 + cp / 4096 % 64));
+                    out.write_char(cast<char>(128 + cp / 64 % 64));
+                    out.write_char(cast<char>(128 + cp % 64));
+                }
+            } else { self.valid = false; }
+        }
+        if (!closed) { self.valid = false; }
+        let result <string> = out.to_string();
+        free_buffer(out);
+        return result;
+    }
+
+    pub fun literal(self: &Self, word: string) <bool> {
+        let chars <[char]> = to_chars(word);
+        let n <int> = len(word);
+        let ok <bool> = self.pos + n <= self.end;
+        for (let i <int> = 0; i < n && ok; i++) {
+            if (self.bytes[self.pos + i] != chars[i]) { ok = false; }
+        }
+        delete chars;
+        if (ok) { self.pos += n; }
+        return ok;
+    }
+
+    pub fun value(self: &Self, depth: int) <bool> {
+        self.ws();
+        if (depth > 128 || self.pos >= self.end) { return false; }
+        let c <char> = self.bytes[self.pos];
+        if (c == '"') {
+            let s <string> = self.string_value();
+            free_str(s);
+            return self.valid;
+        }
+        if (c == '{' || c == '[') {
+            self.pos++;
+            let close <char> = ']';
+            if (c == '{') { close = '}'; }
+            if (self.take(close)) { return true; }
+            while (self.pos < self.end) {
+                if (c == '{') {
+                    let key <string> = self.string_value();
+                    free_str(key);
+                    if (!self.valid || !self.take(':')) { return false; }
+                }
+                if (!self.value(depth + 1)) { return false; }
+                if (self.take(close)) { return true; }
+                if (!self.take(',')) { return false; }
+            }
+            return false;
+        }
+        if (c == 'n') { return self.literal("null"); }
+        if (c == 't') { return self.literal("true"); }
+        if (c == 'f') { return self.literal("false"); }
+        if (c == '-') { self.pos++; }
+        if (self.pos >= self.end) { return false; }
+        c = self.bytes[self.pos];
+        if (c < '0' || c > '9') { return false; }
+        self.pos++;
+        if (c != '0') {
+            while (self.pos < self.end && self.bytes[self.pos] >= '0'
+                   && self.bytes[self.pos] <= '9') { self.pos++; }
+        }
+        if (self.pos < self.end && self.bytes[self.pos] == '.') {
+            self.pos++;
+            let first <int> = self.pos;
+            while (self.pos < self.end && self.bytes[self.pos] >= '0'
+                   && self.bytes[self.pos] <= '9') { self.pos++; }
+            if (first == self.pos) { return false; }
+        }
+        if (self.pos < self.end && (self.bytes[self.pos] == 'e' || self.bytes[self.pos] == 'E')) {
+            self.pos++;
+            if (self.pos < self.end && (self.bytes[self.pos] == '+' || self.bytes[self.pos] == '-')) {
+                self.pos++;
+            }
+            let first <int> = self.pos;
+            while (self.pos < self.end && self.bytes[self.pos] >= '0'
+                   && self.bytes[self.pos] <= '9') { self.pos++; }
+            if (first == self.pos) { return false; }
+        }
+        return true;
+    }
+}
+
+priv fun field_id(key: string) <int> {
+    if (equals(key, "kind")) { return 0; }
+    if (equals(key, "severity")) { return 1; }
+    if (equals(key, "message")) { return 2; }
+    if (equals(key, "file")) { return 3; }
+    if (equals(key, "line")) { return 4; }
+    if (equals(key, "column")) { return 5; }
+    if (equals(key, "errors")) { return 6; }
+    if (equals(key, "warnings")) { return 7; }
+    if (equals(key, "exitCode")) { return 8; }
+    if (equals(key, "status")) { return 9; }
     return -1;
 }
 
-// The value of `"key":"...."` as a real string: slice the RAW span (opening
-// quote through the escape-aware closing quote) and let json_decode_str own
-// the unescaping. Absent or malformed → "". Caller frees.
-priv fun span_val(b: [char], end: int, key: string) <string> {
-    let hit <int> = find_in(b, end, key);
-    if (hit < 0) { return ""; }
-    let i <int> = hit + len(key);
-    while (i < end && b[i] != '"') { i = i + 1; } // skip to the opening quote
-    if (i >= end) { return ""; }
-    let start <int> = i;
-    i = i + 1;
-    let closed <int> = 0;
-    while (i < end && closed == 0) {
-        if (b[i] == '\\') {
-            i = i + 2;
-        } else if (b[i] == '"') {
-            closed = 1;
-        } else {
-            i = i + 1;
+priv fun record_fields(rec: &JsonRecord, starts: [int], ends: [int]) <bool> {
+    for (let i <int> = 0; i < 10; i++) { starts[i] = -1; }
+    if (!rec.take('{')) { return false; }
+    if (!rec.take('}')) {
+        let closed <bool> = false;
+        while (rec.pos < rec.end) {
+            let key <string> = rec.string_value();
+            let id <int> = field_id(key);
+            free_str(key);
+            if (!rec.valid || !rec.take(':')) { return false; }
+            rec.ws();
+            let start <int> = rec.pos;
+            if (!rec.value(0)) { return false; }
+            if (id >= 0) {
+                if (starts[id] >= 0) { return false; }
+                starts[id] = start;
+                ends[id] = rec.pos;
+            }
+            if (rec.take('}')) { closed = true; break; }
+            if (!rec.take(',')) { return false; }
         }
+        if (!closed) { return false; }
     }
-    if (closed == 0) { return ""; }
-    let span <string> = from_chars(b, start, i - start + 1);
-    let dec <Outcome<string>> = json_decode_str(span);
-    free_str(span);
-    if (dec.is_ok()) { return dec.value; }
-    return "";
+    rec.ws();
+    return rec.valid && rec.pos == rec.end && starts[0] >= 0;
 }
 
-// The value of `"key":N` as an int; -1 = absent (callers pick defaults:
-// 0 for counts, 0 for line/col).
-priv fun span_int(b: [char], end: int, key: string) <int> {
-    let hit <int> = find_in(b, end, key);
-    if (hit < 0) { return -1; }
-    let i <int> = hit + len(key);
-    while (i < end && b[i] != ':') { i = i + 1; }
-    if (i >= end) { return -1; }
-    i = i + 1;
-    while (i < end && b[i] == ' ') { i = i + 1; }
-    if (i >= end) { return -1; }
-    let neg <int> = 1;
-    if (b[i] == '-') {
-        neg = -1;
-        i = i + 1;
-    }
-    if (i >= end || b[i] < '0' || b[i] > '9') { return -1; }
-    let v <int> = 0;
-    while (i < end && b[i] >= '0' && b[i] <= '9') {
-        v = v * 10 + b[i] - '0';
-        i = i + 1;
-    }
-    return v * neg;
+priv fun field_string(rec: &JsonRecord, start: int, end: int, nullable: bool) <string> {
+    if (start < 0) { rec.valid = false; return clone(""); }
+    let part <JsonRecord> = JsonRecord{bytes: rec.bytes, pos: start, end: end};
+    if (nullable && part.literal("null")) { return clone(""); }
+    let result <string> = part.string_value();
+    if (!part.valid) { rec.valid = false; }
+    return result;
 }
 
-// ---- the JSONL pass: contract forwarding, summaries, and findings -----------
+priv fun field_int(rec: &JsonRecord, start: int, end: int) <int> {
+    if (start < 0) { rec.valid = false; return 0; }
+    let n <long> = cast<long>(0);
+    for (let i <int> = start; i < end; i++) {
+        let c <char> = rec.bytes[i];
+        if (c < '0' || c > '9') { rec.valid = false; return 0; }
+        n = n * cast<long>(10) + cast<long>(c - '0');
+        if (n > cast<long>(2147483647)) { rec.valid = false; return 0; }
+    }
+    return cast<int>(n);
+}
 
-priv fun chew_bytes(run: &Run, b: [char], end: int, contract_mode: int) <noret> {
-    let diag_key <string> = "\"kind\":\"diagnostic\"";
-    let summary_key <string> = "\"kind\":\"summary\"";
-
+// One invocation, one valid trailing summary. Invalid records never leak raw
+// text into JSONL output. Valid unknown kinds do, byte-for-byte.
+priv fun chew_bytes(run: &Run, b: [char], end: int, contract_mode: int, path: string) <bool> {
+    let starts <[int]> = new [int, 10]{};
+    let ends <[int]> = new [int, 10]{};
     let start <int> = 0;
+    let summaries <int> = 0;
+    let broken <bool> = false;
+    let errors <int> = 0;
+    let warnings <int> = 0;
+    let summary_errors <int> = 0;
+    let summary_warnings <int> = 0;
+    let summary_code <int> = 0;
     while (start < end) {
         let e <int> = start;
-        while (e < end && b[e] != '\n') {
-            e = e + 1;
-        }
-        if (e == start) {
-            start = start + 1;
+        while (e < end && b[e] != '\n') { e++; }
+        if (summaries > 0) { broken = true; }
+        let rec <JsonRecord> = JsonRecord{bytes: b, pos: start, end: e};
+        if (!record_fields(&rec, starts, ends)) {
+            broken = true;
+            start = e + 1;
             continue;
         }
-
-        let is_sum <int> = 0;
-        if (find_in(b, e, summary_key) >= 0) { is_sum = 1; }
-
-        if (is_sum == 1) {
-            let errs <int> = span_int(b, e, "\"errors\"");
-            let warns <int> = span_int(b, e, "\"warnings\"");
-            if (errs > 0) { run.finc_errors = run.finc_errors + errs; }
-            if (warns > 0) { run.finc_warnings = run.finc_warnings + warns; }
-            // finc's OWN summary is the authoritative exit (contract):
-            // this is how "finished cleanly" vs "died" is known without
-            // trusting the popen waitstatus.
-            let finc_code <int> = span_int(b, e, "\"exitCode\"");
-            if (finc_code >= 0) { run.worsen(finc_code); }
-            run.saw_summary = run.saw_summary + 1;
-        } else if (contract_mode != 0) {
-            // contract format: finc's diagnostics forward VERBATIM (unknown
-            // kinds intact); linf's additions render after the run.
-            let raw <string> = from_chars(b, start, e - start);
-            cli_dprintf(2, "%s\n", raw);
-            free_str(raw);
-        } else if (find_in(b, e, diag_key) >= 0) {
-            let sev <string> = span_val(b, e, "\"severity\"");
-            let msg <string> = span_val(b, e, "\"message\"");
-            let file <string> = span_val(b, e, "\"file\"");
-            let ln <int> = span_int(b, e, "\"line\"");
-            let cl <int> = span_int(b, e, "\"column\"");
-            let use_ln <int> = ln;
-            if (use_ln < 0) { use_ln = 0; }
-            let use_cl <int> = cl;
-            if (use_cl < 0) { use_cl = 0; }
-            run.add(sev_map(sev), "", msg, file, use_ln, use_cl);
+        let kind <string> = field_string(&rec, starts[0], ends[0], false);
+        if (equals(kind, "summary")) {
+            summaries++;
+            summary_errors = field_int(&rec, starts[6], ends[6]);
+            summary_warnings = field_int(&rec, starts[7], ends[7]);
+            summary_code = field_int(&rec, starts[8], ends[8]);
+            let status <string> = field_string(&rec, starts[9], ends[9], false);
+            if (summary_code > 3 || (summary_code == 0 && !equals(status, "ok"))
+                || (summary_code != 0 && !equals(status, "failed"))) { rec.valid = false; }
+            free_str(status);
+        } else if (equals(kind, "diagnostic")) {
+            let sev <string> = field_string(&rec, starts[1], ends[1], false);
+            let msg <string> = field_string(&rec, starts[2], ends[2], false);
+            let file <string> = field_string(&rec, starts[3], ends[3], true);
+            let ln <int> = field_int(&rec, starts[4], ends[4]);
+            let col <int> = field_int(&rec, starts[5], ends[5]);
+            if (rec.valid) {
+                let level <int> = sev_map(sev);
+                if (level == 2) { errors++; }
+                if (level == 1) { warnings++; }
+                if (contract_mode == 0) { run.add(level, "", msg, file, ln, col); }
+                if (level > 0) { run.worsen(1); }
+            }
             free_str(sev);
             free_str(msg);
             free_str(file);
         }
+        if (!rec.valid) { broken = true; }
+        else if (contract_mode != 0 && !equals(kind, "summary")) {
+            let raw <string> = from_chars(b, start, e - start);
+            cli_dprintf(2, "%s\n", raw);
+            free_str(raw);
+        }
+        free_str(kind);
         start = e + 1;
     }
+    delete starts;
+    delete ends;
+    let complete <bool> = !broken && summaries == 1;
+    if (complete) {
+        if (summary_errors > errors) { errors = summary_errors; }
+        if (summary_warnings > warnings) { warnings = summary_warnings; }
+        run.worsen(summary_code);
+    } else {
+        run.add(2, "linf:plumbing", "finc did not produce exactly one valid trailing summary", path, 0, 0);
+        run.worsen(2);
+    }
+    run.finc_errors += errors;
+    run.finc_warnings += warnings;
+    return complete;
+}
+
+// POSIX shell words, not shell fragments. argv and Fin strings are already
+// NUL-terminated: embedded NUL cannot be supplied as a command-line argument.
+priv fun shell_word(text: string) <string> {
+    let out <Buffer> = new_buffer(32);
+    let chars <[char]> = to_chars(text);
+    out.write_char('\'');
+    for (let i <int> = 0; i < len(text); i++) {
+        if (chars[i] == '\'') { out.write_string("'\\''"); }
+        else { out.write_char(chars[i]); }
+    }
+    out.write_char('\'');
+    delete chars;
+    let result <string> = out.to_string();
+    free_buffer(out);
+    return result;
 }
 
 // ---- the three token rules, proven in fin-sdk's linf_first_rules.fin -------
+
+priv fun import_stem(source: string) <string> {
+    let chars <[char]> = to_chars(source);
+    let begin <int> = 0;
+    let end <int> = len(source);
+    let dot <int> = -1;
+    for (let i <int> = 0; i < end; i++) {
+        if (chars[i] == '/') { begin = i + 1; dot = -1; }
+        else if (chars[i] == '.') { dot = i; }
+    }
+    if (dot > begin) { end = dot; }
+    let result <string> = from_chars(chars, begin, end - begin);
+    delete chars;
+    return result;
+}
+
+priv fun lint_imports(run: &Run, path: string, l: CdkTokens) <noret> {
+    // At most one binding per token. Declarations are excluded from usage
+    // scans, so a later import cannot make an earlier unused name look used.
+    let names <[string]> = new [string, l.count]{};
+    let positions <[int]> = new [int, l.count]{};
+    let boundaries <[int]> = new [int, l.count]{};
+    let declarations <[int]> = new [int, l.count]{};
+    let count <int> = 0;
+    let i <int> = 0;
+    while (i < l.count) {
+        if (l.tokens[i].kind != kw_import()) { i++; continue; }
+        let end <int> = i + 1;
+        while (end < l.count && l.tokens[end].kind != tok_semicolon()) { end++; }
+        if (end == l.count) { break; } // finc owns malformed declarations
+        for (let j <int> = i; j <= end; j++) { declarations[j] = end + 1; }
+        let first <int> = count;
+        let j <int> = i + 1;
+        if (j < end && l.tokens[j].kind == tok_lbrace()) {
+            j++;
+            while (j < end && l.tokens[j].kind != tok_rbrace()) {
+                if (l.tokens[j].kind == tok_ident()) {
+                    let name <string> = clone(l.tokens[j].text);
+                    names[count] = name;
+                    positions[count] = j;
+                    count++;
+                }
+                j++;
+            }
+        } else if (j < end && (l.tokens[j].kind == tok_ident()
+                   || l.tokens[j].kind == tok_string_lit())) {
+            let binding <string> = "";
+            let pos <int> = j;
+            let alias <int> = j;
+            while (alias < end && l.tokens[alias].kind != kw_as()) { alias++; }
+            if (alias + 1 < end && l.tokens[alias + 1].kind == tok_ident()) {
+                pos = alias + 1;
+                binding = clone(l.tokens[pos].text);
+            } else if (l.tokens[j].kind == tok_string_lit()) {
+                let decoded <Outcome<string>> = json_decode_str(l.tokens[j].text);
+                if (decoded.is_ok()) {
+                    binding = import_stem(decoded.value);
+                    free_str(decoded.value);
+                }
+            } else {
+                let module <Buffer> = new_buffer(32);
+                while (j < end && (l.tokens[j].kind == tok_ident() || l.tokens[j].kind == tok_dot())) {
+                    module.write_string(l.tokens[j].text);
+                    j++;
+                }
+                let source <string> = module.to_string();
+                free_buffer(module);
+                binding = import_stem(source);
+                free_str(source);
+            }
+            if (!equals(binding, "")) {
+                names[count] = binding;
+                positions[count] = pos;
+                count++;
+            }
+        }
+        // Wildcard imports introduce an unknown set of bindings: no guesses.
+        for (let n <int> = first; n < count; n++) { boundaries[n] = end + 1; }
+        i = end + 1;
+    }
+    for (let n <int> = 0; n < count; n++) {
+        let used <bool> = false;
+        let j <int> = boundaries[n];
+        while (j < l.count) {
+            if (declarations[j] != 0) { j = declarations[j]; continue; }
+            if (l.tokens[j].kind == tok_ident() && equals(names[n], l.tokens[j].text)) {
+                used = true;
+                break;
+            }
+            j++;
+        }
+        if (!used) {
+            let head <string> = concat("import '", names[n]);
+            let msg <string> = concat(head, "' is never used in this file");
+            run.add(1, "linf:unused-import", msg, path, l.tokens[positions[n]].line, 1);
+            free_str(head);
+            free_str(msg);
+        }
+        free_str(names[n]);
+    }
+    delete names;
+    delete positions;
+    delete boundaries;
+    delete declarations;
+}
 
 priv fun lint_source(run: &Run, path: string, text: string) <noret> {
     // Rule 1: line length (first long line per file, v0 per RFC §4).
@@ -288,13 +595,9 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
 
     // Rules 2 + 3: one token pass (delete-without-new and unused-import).
     let l <CdkTokens> = cdk_scan(text);
-    let names <[int]> = new [int, 32]{};
-    let n_names <int> = 0;
-    let after_semi <int> = -1;
     let has_delete <int> = 0;
     let has_new <int> = 0;
     let first_delete_line <int> = 0;
-    let state <int> = 0; // 0 outside, 1 between import and from, 2 after from
     let first_index_line <int> = 0;
     let has_blame <int> = 0;
     let j <int> = 0;
@@ -318,18 +621,6 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
                 first_index_line = l.tokens[j].line;
             }
         }
-        if (state == 0) {
-            if (k == kw_import()) { state = 1; }
-        } else if (state == 1) {
-            if (k == kw_from()) {
-                state = 2;
-            } else if (k == tok_ident() && n_names < 32) {
-                names[n_names] = j;
-                n_names = n_names + 1;
-            }
-        } else {
-            if (k == tok_semicolon()) { after_semi = j; state = 0; }
-        }
         j = j + 1;
     }
 
@@ -342,33 +633,39 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
               path, first_index_line, 1);
     }
 
-    let idx <int> = 0;
-    while (idx < n_names) {
-        let ni <int> = names[idx];
-        let used <int> = 0;
-        let m <int> = after_semi + 1;
-        while (m < l.count) {
-            if (l.tokens[m].kind == tok_ident()
-                && equals(l.tokens[ni].text, l.tokens[m].text)) {
-                used = 1;
-            }
-            m = m + 1;
-        }
-        if (used == 0) {
-            let head <string> = concat("import '", l.tokens[ni].text);
-            let msg <string> = concat(head, "' is never used in this file");
-            free_str(head);
-            run.add(1, "linf:unused-import", msg, path, l.tokens[ni].line, 1);
-            free_str(msg);
-        }
-        idx = idx + 1;
-    }
-    delete names;
+    lint_imports(run, path, l);
 
     free_cdk_tokens(l);
 }
 
 // ---- renderers --------------------------------------------------------------
+
+// Frozen json::std treats signed UTF-8 bytes as controls. Preserve those bytes
+// here while escaping the actual JSON controls; never generate invalid hex.
+priv fun json_encode_str(text: string) <string> {
+    let chars <[char]> = to_chars(text);
+    let hex <[char]> = to_chars("0123456789abcdef");
+    let out <Buffer> = new_buffer(32);
+    out.write_char('"');
+    for (let i <int> = 0; i < len(text); i++) {
+        let c <char> = chars[i];
+        let byte <int> = cast<int>(c);
+        if (byte < 0) { byte += 256; }
+        if (c == '"') { out.write_string("\\\""); }
+        else if (c == '\\') { out.write_string("\\\\"); }
+        else if (byte < 32) {
+            out.write_string("\\u00");
+            out.write_char(hex[byte / 16]);
+            out.write_char(hex[byte % 16]);
+        } else { out.write_char(c); }
+    }
+    out.write_char('"');
+    delete chars;
+    delete hex;
+    let result <string> = out.to_string();
+    free_buffer(out);
+    return result;
+}
 
 priv fun write_contract_line(f: &Fnd) <noret> {
     let enc_msg <string> = json_encode_str(f.message);
@@ -420,8 +717,8 @@ priv fun write_sarif(run: &Run, version: string) <noret> {
     cli_dprintf(2, "{\"version\":\"2.1.0\",\"$schema\":\"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"linf\",\"version\":\"%s\",\"informationUri\":\"https://github.com/M1778/Linf\",\"rules\":[{\"id\":\"linf:line-length\"},{\"id\":\"linf:unused-import\"},{\"id\":\"linf:delete-without-new\"},{\"id\":\"linf:unchecked-index\"},{\"id\":\"linf:fmt-drift\"}]}},\"results\":[", version);
     let first <int> = 1;
     let idx <int> = 0;
-    while (idx < run.count) {
-        let f <Fnd> = run.fnds[idx];
+    while (idx < run.size()) {
+        let f <Fnd> = *run.at(idx);
         if (first == 0) {
             cli_dprintf(2, ",");
         }
@@ -499,10 +796,14 @@ fun main() <int> {
 
         // finc is the source of truth (RFC §1). The capture merges stderr
         // into the read pipe: finc's stdout is contract-silent here.
-        let base <string> = concat(finc_bin, " \"");
-        let one <string> = concat(base, path);
+        let executable <string> = shell_word(finc_bin);
+        let source <string> = shell_word(path);
+        let base <string> = concat(executable, " ");
+        let one <string> = concat(base, source);
+        free_str(executable);
+        free_str(source);
         free_str(base);
-        let two <string> = concat(one, "\" --diagnostics=json --color=never 2>&1");
+        let two <string> = concat(one, " --diagnostics=json --color=never 2>&1");
         free_str(one);
         let res <ProcessResult> = exec_command(two);
         free_str(two);
@@ -514,48 +815,34 @@ fun main() <int> {
             let raw_text <string> = res.output;
             let total <int> = len(raw_text);
 
-            let saw_before <int> = run.saw_summary;
             let contract <int> = 0;
             if (format_mode == 0) { contract = 1; }
             let usable <[char]> = to_chars(raw_text);
-            chew_bytes(&run, usable, total, contract);
+            let complete <bool> = chew_bytes(&run, usable, total, contract, path);
             delete usable;
 
-            // No summary this path: finc died before reporting. The popen
-            // waitstatus decodes as the fallback (low byte nonzero = signal
-            // kill = compiler failure; shell 127-normalized = plumbing).
-            if (run.saw_summary == saw_before) {
+            // A missing/broken summary is always plumbing, even when another
+            // invocation completed. Preserve compiler-failure precedence.
+            if (!complete) {
                 let st <int> = res.exit_code;
                 let high <int> = st / 256;
                 let rem <int> = st - high * 256;
-                if (rem != 0) {
+                if (rem != 0 || high == 3 || (high >= 128 && high <= 192)) {
                     run.worsen(3);
-                } else {
-                    run.worsen(high);
                 }
             }
 
-            // The rules (RFC §4) only when the source itself is readable; an
-            // unreadable path already reached finc (its exit 2 propagates).
-            if (res.exit_code != 2) {
-                let src? <string> = read_to_string(path);
-                if (src != null) {
-                    lint_source(&run, path, src?);
-                    free_file_content(src);
-                }
+            // Rules require readable source. finc remains the only authority
+            // on compilation; linter rules never manufacture compiler errors.
+            let src? <string> = read_to_string(path);
+            if (src != null) {
+                lint_source(&run, path, src?);
+                free_file_content(src);
             }
         }
         free_process_result(res);
 
         pi = pi + 1;
-    }
-
-    // A missing summary is a plumbing failure (RFC §1): finc died before
-    // reporting. The contract guarantees exactly one summary per run,
-    // including on exit 2 and 3.
-    if (run.saw_summary <= 0) {
-        run.add(2, "linf:plumbing", "finc produced no summary line", "", 0, 0);
-        run.worsen(2);
     }
 
     // Findings worsen the exit per the mirror: anything user-facing fires 1.
@@ -566,23 +853,23 @@ fun main() <int> {
     if (format_mode == 0) {
         // linf-owned lines only; finc's own already streamed verbatim above.
         let i <int> = 0;
-        while (i < run.count) {
-            let f <Fnd> = run.fnds[i];
+        while (i < run.size()) {
+            let f <Fnd> = *run.at(i);
             if (!equals(f.code, "")) {
-                write_contract_line(&run.fnds[i]);
+                write_contract_line(run.at(i));
             }
             i = i + 1;
         }
     } else if (format_mode == 1) {
         let i <int> = 0;
-        while (i < run.count) {
-            write_gcc_line(&run.fnds[i]);
+        while (i < run.size()) {
+            write_gcc_line(run.at(i));
             i = i + 1;
         }
     } else if (format_mode == 2) {
         let i <int> = 0;
-        while (i < run.count) {
-            write_actions_line(&run.fnds[i]);
+        while (i < run.size()) {
+            write_actions_line(run.at(i));
             i = i + 1;
         }
     } else {
@@ -603,11 +890,13 @@ fun main() <int> {
     // Ownership: every entry's strings were cloned at add time.
     let i <int> = 0;
     while (i < run.count) {
-        free_str(run.fnds[i].code);
-        free_str(run.fnds[i].message);
-        free_str(run.fnds[i].file);
+        let f <&Fnd> = run.at(i);
+        free_str(f.code);
+        free_str(f.message);
+        free_str(f.file);
         i = i + 1;
-    }    delete run.fnds;
+    }
+    delete run.fnds;
     free_match(m);
 
     return run.linf_exit;

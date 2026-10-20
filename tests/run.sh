@@ -6,15 +6,18 @@ set -u
 
 FINC="${FINC:-/home/M1778/Fin/build/finc}"
 SDK_LIB="${SDK_LIB:-$HOME/fin-sdk/lib}"
+OPT="${OPT:--O0}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HERE/.linftest"
+BUILD_ERR="$HERE/.build-err"
+trap 'rm -f "$HERE/.out" "$HERE/.stdout" "$BIN" "$BUILD_ERR"' EXIT
 
 FAIL=0
 pass() { echo "PASS $1"; }
 defy() { echo "FAIL $1"; FAIL=1; }
 
-"$FINC" "$HERE/../src/linf.fin" -o "$BIN" --fin-libs "$SDK_LIB" 2>/tmp/lerr || {
-  echo "FAIL build"; head -5 /tmp/lerr; exit 1; }
+"$FINC" "$HERE/../src/linf.fin" "$OPT" -o "$BIN" --fin-libs "$SDK_LIB" 2>"$BUILD_ERR" || {
+  echo "FAIL build"; head -5 "$BUILD_ERR"; exit 1; }
 pass build
 
 # everything runs from the fixture dir so pinned lines/patterns hold
@@ -102,6 +105,8 @@ grep -q "unknown option" "$OUT" && pass "bad-option-msg" && { [ "$RC" -eq 2 ] &&
 # 8. multi-path totals combine
 run fixture_ok.fin fixture_bad.fin fixture_linted.fin
 grep -qF '"errors":1,"warnings":3,"exitCode":1' "$OUT" && pass "multi-totals" || defy "multi-totals"
+
+python3 -I "$HERE/regressions.py" "$BIN" "$FINC" || defy "production-regressions"
 
 rm -f "$OUT" "$HERE/.stdout" "$BIN"
 if [ "$FAIL" -eq 0 ]; then echo "ALL LINF SELF-CHECKS PASS"; else echo "LINF SELF-CHECK FAILURES"; exit 1; fi
