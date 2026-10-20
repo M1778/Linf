@@ -1,20 +1,31 @@
 # Linf
 
 The linter for Fin: `finc` = compiler errors, **`linf` = style warnings**.
-Name and binary spellings are approved (M1778/Fin#50 §4); this repo is the
-scaffold.
+Name and binary spellings are approved (M1778/Fin#50 §4); the `linf` v0
+binary is real and shipped in this repo, written **in Fin** against the
+[`M1778/fin-sdk`](https://github.com/M1778/fin-sdk) bundle.
 
 - **Read `RFC.md` first** — architecture (build on `finc --diagnostics=json`,
-  never re-lex), CLI + exit codes, the frozen five-rule v0 list, and the
-  evidence probes.
-- **Status** — scaffold only. The `linf` binary does not exist yet; stages
-  live in the RFC §5. The three token rules already have a *proven
-  prototype*: `linf_first_rules.fin` in
-  [`M1778/fin-sdk`](https://github.com/M1778/fin-sdk) — line-length,
-  unused-import, delete-without-new, written in Fin against the SDK's own
-  scanner and diagnostics, exiting 1 on findings.
+  never re-lex), CLI/lanes/exit codes, the frozen five-rule v0 list, stages,
+  and the evidence probes.
+- **`INTEGRATION.md`** — copy-paste harnesses for VS Code (`problemMatcher:
+  "$gcc"` on the `gcc` lane), Neovim (`errorformat`), GitHub Actions annotations,
+  GitHub code scanning + SARIF viewers, and the LSP story (`finls` wrapper).
+- **Status — v0 shipped**: `src/linf.fin` builds into the `linf` binary with
+  four output lanes (`contract`/`gcc`/`actions`/sarif), the three scanner
+  rules + line length live, the exit-code mirror holds
+  (0 clean · 1 findings · 2 usage/plumbing · 3 finc failure propagated), and
+  `tests/run.sh` pins all 23 self-check behaviors.
+- **Try it**:
+  ```sh
+  FINC=/path/to/finc SDK_LIB=/path/to/fin-sdk/lib tests/run.sh
+  # or by hand:
+  finc src/linf.fin -o linf --fin-libs /path/to/fin-sdk/lib
+  ./linf check path/to/your.fin --format gcc
+  ```
+- **Rules status**: line-length / unused-import / delete-without-new shipped;
+  unchecked-index planned; `fmt-drift` blocked until `finfmt --check`'s exit
+  code is drift-truthful (RFC §4 records the probe).
 - **Contract** — plumbing pinned to the finc machine contract v3
   (`kFincContractVersion`); `VERSION` major tracks it, same policy as
-  `fin-sdk`.
-- **fmt-drift rule** — blocked until `finfmt --check`'s exit code is
-  drift-truthful (RFC §4 records the probe); nothing blocks rules 1–4.
+  `fin-sdk` (currently 3.0.0).

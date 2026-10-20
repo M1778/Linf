@@ -26,12 +26,26 @@ forks a second lexer.** Linf builds on the machine contract the way `finn` build
    error. A **missing summary means finc died before reporting** — that is a
    Linf plumbing failure (`exit 2`), because the contract says the summary is
    the only way to tell "finished cleanly" from "died".
+   Two capture rulings the v0 binary pins:
+   - the capture merges `2>&1` into the read pipe (process.fin's
+     `exec_command` captures stdout), sound only because finc's stdout is
+     contract-silent for every non-reserved flag — which is exactly what
+     this invocation uses;
+   - finc's **own summary line is the authoritative exit source** (its
+     `exitCode` field), because the popen waitstatus is raw pclose
+     (256×rc); the waitstatus decodes only as a fallback when no summary
+     arrived (low byte nonzero = signal kill = `3`; shell 127 = `2`).
 3. Linf appends **its own findings as `diagnostic` objects in the same shape**
    (`severity: "warning"` v0, `code: "linf:<rule>"` — `code` is contract-open
    to new values, `help` may carry a fix-suggestion), then emits **one
    summary** whose `errors`/`warnings` count the whole pass-through stream and
    whose `exitCode` is Linf's own. Existing JSON-diagnostic consumers can read
    Linf's output without knowing Linf.
+   Field extraction (non-contract lanes) is key-anchored over the raw bytes
+   (`"severity"`, `"message"`, `"file"`, `"line"`, `"column"`,
+   `"exitCode"`, `"errors"`, `"warnings"`), unescaping through json.fin's
+   `json_decode_str` — contract shapes today, no general JSON reader; a
+   nested-object key addition would move linf to a real read pass.
 
 ## 2. Rule facts: where they come from
 
@@ -49,16 +63,40 @@ Ranked, most contract-true first:
 4. **From a subprocess only for formatting** — planned (see rule 5);
    `process::std::exec_command` exists when needed.
 
-## 3. CLI + exit codes
+## 3. CLI, lanes, exit codes
 
 ```
-linf check [paths...]     # style warnings; the only subcommand in v0
-linf --help               # stdout, exit 0
-linf --version  →  "linf <semver> (contract <int>)"
+linf check [--format <lane>] [--finc <bin>] <path>...   # the only subcommand in v0
+linf --help                                             # stdout, exit 0
+linf --version  →  "linf <semver> (contract <int>)"     # stdout, exit 0
 ```
 
-stdout is reserved for `--help`/`--version` only — everything else is
-JSONL on stderr, mirroring finc's stream discipline.
+Options spell two tokens (`--format gcc`), following cli.fin's grammar —
+the same grammar family the `linf` binary compiles against. finc's own
+`--diagnostics=json` spelling is finc's native parser, a separate grammar;
+the contract doc stays the plumbing source, not the spelling source.
+
+`--format` picks the output lane; everything lands on **stderr** (stdout
+stays reserved to `--help`/`--version`, mirroring finc):
+
+| lane | shape | the hosts that eat it |
+| --- | --- | --- |
+| `contract` (default) | finc's JSONL forwarded VERBATIM + linf's own `diagnostic` lines + one trailing `summary` | `finn`, LSP wrappers, CI tooling — contract-compatible without knowing linf |
+| `gcc` | `file:line:col: severity: message` one-liners + JSONL summary | VS Code `problemMatcher: "$gcc"`, Neovim errorformat, make/junit tooling |
+| `actions` | GitHub workflow commands: `::warning file=...,line=...,col=...::msg` | GitHub Actions annotations (`note` maps to `notice`) |
+| `sarif` | SARIF 2.1.0 document (five linf rules declared; finc-sourced results carry no `ruleId`) | GitHub code scanning, SARIF Viewer (VS Code/JetBrains), SonarQube ingesters |
+
+Lane rulings the v0 binary pins:
+- **contract**: finc's unknown kinds survive untouched (raw forwarding).
+- **gcc/actions/sarif**: built from extractions; unknown kinds are skipped
+  (a rendered line cannot represent them) — the RFC's tolerance promise
+  applies to the contract lane.
+- **sarif**: the document is the terminal artifact — NO trailing JSONL
+  summary line, because SARIF consumers choke on it. The three line lanes
+  keep the summary.
+- Location-less diagnostics (finc flag refusals, linf plumbing) render as
+  `linf: severity: message` (or `finc:` when finc-sourced) in the gcc lane
+  and omit `file=` in the actions lane; SARIF omits `locations`.
 
 Exit codes **mirror finc's meanings, adapted to a linter**:
 
@@ -69,16 +107,19 @@ Exit codes **mirror finc's meanings, adapted to a linter**:
 | `2` | Bad usage, unreadable path, or **missing/broken summary** (plumbing) | finc `2` |
 | `3` | finc itself failed — propagate: "a bug in finc, not in the source or linf" | finc `3` |
 
-An exit code cannot distinguish "clean" from "crashed"; the summary is what
-consumers trust, per the contract.
+linf's own failures (unknown option handled by cli.fin's message, no paths,
+unknown lane, unreadable path with no finc 1, missing summary) are usage- and
+plumbing-plane `2`s, reported as contract JSONL on stderr like everything
+else. An exit code cannot distinguish "clean" from "crashed"; the summary is
+what consumers trust, per the contract.
 
 ## 4. Rules — v0 list (five, frozen until a ruling expands it)
 
 | rule | code | level | detection | status |
 | --- | --- | --- | --- | --- |
-| line length > 100 | `linf:line-length` | warning | raw lines | **proven** (fin-sdk proof, one warn/file) |
-| unused import | `linf:unused-import` | warning | scanner (name never spelled after its import) | **proven** (fin-sdk proof) |
-| `delete` without `new` | `linf:delete-without-new` | warning | scanner (file says `delete`, never `new`) | **proven** (fin-sdk proof; v0 file-level) |
+| line length > 100 | `linf:line-length` | warning | raw lines | **shipped** (linf v0 binary; proven earlier in fin-sdk) |
+| unused import | `linf:unused-import` | warning | scanner (name never spelled after its import) | **shipped** (linf v0 binary; finc emits no unused-import fact, so this is linf's own) |
+| `delete` without `new` | `linf:delete-without-new` | warning | scanner (file says `delete`, never `new`) | **shipped** (linf v0 binary; v0 file-level) |
 | unchecked index without `blame` | `linf:unchecked-index` | warning | scanner (bracket-index in a file with no `blame`); honest wording until a semantic pass exists | planned |
 | `fin fmt` drift | `linf:fmt-drift` | warning | subprocess byte-compare vs `finfmt` | **blocked on `finfmt`**: its `--check` exits `0` on drift today (evidence below) |
 
@@ -88,11 +129,14 @@ registry).
 
 ## 5. Stages
 
-1. **This commit** — RFC + repo scaffold; contract v3 pinned; evidence gathered.
-2. **Rules stage** — the fin-sdk proof graduates: rules live here, still
-   written in Fin against the SDK bundle.
-3. **Binary stage** — `linf` CLI: contract pass-through + rule findings in one
-   JSONL stream, exit mirror honored, tested against `bad.fin`-class probes.
+1. **RFC + scaffold** — done (previous commit): contract v3 pinned, evidence gathered.
+2. **Rules stage** — done in the same landing: the three scanner rules and
+   line length live in `src/linf.fin` (still written in Fin against the SDK
+   bundle, which grew `cli`, `process`, `json`, `hashmap` at 3.1/3.2.0 to
+   carry them).
+3. **Binary stage** — done at v0: `src/linf.lin`?
+   `src/linf.fin` builds into the `linf` binary; four lanes, exit mirror,
+   stream discipline, multi-path totals — all pinned by `tests/run.sh`.
 4. **Package stage** — `finn` packaging once the registry supports it.
 
 Stages 2–4 land as `linf` work in this repo; each lands only with tests that
@@ -119,3 +163,36 @@ but the unknown-kind/severity rules above keep it *forward-tolerant*.
   `fun main ()` spacing) — so rule 5's "planned" status is graded on
   that, not on optimism; `finfmt` is invoked from `process::std` when the
   check mode is real.
+
+Evidence of the v0 binary (all at Fin `a6b4b67`, contract 3, `linf` built
+from `src/linf.fin` against `fin-sdk` 3.2.0):
+- `linf check fixture_ok.fin` → exit 0, stdout **0 bytes**, stderr exactly
+  `{"kind":"summary","errors":0,"warnings":0,"exitCode":0,"status":"ok"}`.
+- `linf check fixture_linted.fin` → exit 1 with exactly three linf findings
+  (`linf:line-length` @5:1, `linf:delete-without-new` @9:1,
+  `linf:unused-import` @1:1) and summary
+  `{"kind":"summary","errors":0,"warnings":3,"exitCode":1,"status":"failed"}`.
+- `linf check fixture_bad.fin` → finc's error forwarded verbatim in the
+  contract lane; `--format gcc` renders `fixture_bad.fin:1:27: error:
+  expected ';'` (the escaped `';'` unescaped through `json_decode_str`);
+  exit 1, summary `errors:1`.
+- `--format sarif` on the linted fixture: 5 rules declared, 3 results with
+  `ruleId`/`level`/`region` correct; on the clean fixture: `results: []`,
+  exit 0; no trailing summary line in the document.
+- `--format actions`: `::warning file=fixture_linted.fin,line=5,col=1::...`.
+- multi-path `check ok bad linted` → one combined summary
+  `errors:1 warnings:3`.
+- usage planes: unknown format → `linf: unknown --format
+  'yaml' (use contract|gcc|actions|sarif)` exit 2; no paths → exit 2;
+  unknown option → cli.fin's `unknown option '--nope'` exit 2 — all
+  contract JSONL or plain usage shapes on stderr, stdout untouched.
+
+## 8. IDE + CI integration
+
+`INTEGRATION.md` carries copy-paste harnesses: VS Code `tasks.json` with the
+`$gcc` matcher (works today; `fin-vscode` ships it natively once its grammar
+lands per #50), Neovim `makeprg`/`errorformat`, GitHub Actions annotation
+runs, GitHub code scanning via the SARIF lane, and SARIF viewers (VS Code /
+JetBrains plugins). `linf` stays CLI on purpose — editors get native
+diagnostics through the `finls` LSP wrapper (#50 §5), and the editor-side
+extension is owned by `fin-vscode` (#50 §1/§7).

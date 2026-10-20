@@ -1,0 +1,593 @@
+// linf.fin — the linf v0 binary. See ../RFC.md for the rulings this implements.
+//
+// THE ARCHITECTURE (RFC §1, non-negotiable): finc is the source of truth. For
+// every path linf runs
+//
+//     finc <path> --diagnostics=json --color=never
+//
+// and parses the contract's JSONL off stderr. The capture merges `2>&1` into
+// the read pipe (process.fin's exec_command captures stdout): sound only
+// because finc's stdout is contract-silent for every non-reserved flag, which
+// is exactly what this invocation uses.
+//
+// Output (RFC §3): the contract shape by default; `--format=gcc` one-liners
+// (VS Code `problemMatcher: "$gcc"`, Neovim errorformat); `--format=actions`
+// workflow annotations; `--format=sarif` 2.1.0 (code scanning, SARIF viewers).
+// Line/SARIF renderings come from key-anchored extractions; the contract
+// format forwards finc's lines VERBATIM — still contract-tolerant of unknown
+// kinds — and renders only linf's own additions (RFC §2 records the split).
+//
+// Exit codes (RFC §3): 0 clean, 1 findings (or sources finc rejected, passed
+// through), 2 usage/IO/plumbing (including a missing summary), 3 propagate a
+// finc failure. linf's own failures are emitted as contract JSONL too.
+//
+// shortcut: findings pool is capped at 256 per run and imported names at 32
+// per file, both static — loud linf-owned limits, upgrade on demand.
+
+import { read_to_string, free_file_content } from fs::std;
+import { ProcessResult, exec_command, free_process_result } from process::std;
+import { Command, Match, Outcome, free_match } from cli::std;
+import { CdkTokens, cdk_scan, free_cdk_tokens } from cdk::std;
+import { tok_ident, tok_semicolon, kw_import, kw_from, kw_new, kw_delete } from token::std;
+import { len, to_chars, from_chars, equals, concat, clone, free_str } from strings::std;
+import { json_encode_str, json_decode_str } from json::std;
+import { cli_dprintf } from cli::std;
+
+// A finding in the contract's field set, renderer-agnostic: linf-owned
+// findings carry `code` ("linf:<rule>"); finc-sourced ones do not, because
+// the contract's `code` is null for finc diagnostics today.
+priv struct Fnd {
+    pub sev <int> = 1, // 0 note 1 warning 2 error (diag.fin's levels)
+    pub code <string> = "",
+    pub message <string> = "",
+    pub file <string> = "",
+    pub line <int> = 1,
+    pub col <int> = 1,
+}
+
+// The whole run's state: the finding pool plus the counters the final
+// summary needs. finc tallies come from its parsed summary lines; linf's own
+// are tracked at add time, split by severity for the totals.
+priv struct Run {
+    pub fnds <[Fnd]>,
+    pub count <int> = 0,
+    pub linf_count <int> = 0,      // findings linf itself owns (code != "")
+    pub linf_errors <int> = 0,     // of those, severity error+
+    pub finc_errors <int> = 0,
+    pub finc_warnings <int> = 0,
+    pub saw_summary <int> = 0,
+    pub linf_exit <int> = 0,       // starts clean; worsens per the mirror
+
+    pub static fun create() <Run> {
+        let pool <[Fnd]> = new [Fnd, 256]{};
+        let r <Run> = Run{fnds: pool, count: 0, linf_count: 0, linf_errors: 0,
+              finc_errors: 0, finc_warnings: 0, saw_summary: 0, linf_exit: 0};
+        return r;
+    }
+
+    // Adds one finding. Strings are COPIED here (strings.fin clone), so
+    // callers may hand literals or extractor temporaries; both frees stay
+    // well-defined.
+    pub fun add(self: &Self, sev: int, code: string, message: string,
+                file: string, line: int, col: int) <noret> {
+        if (self.count >= 256) { return; }
+        let f <Fnd> = Fnd{sev: sev,
+              code: clone(code), message: clone(message), file: clone(file),
+              line: line, col: col};
+        self.fnds[self.count] = f;
+        self.count = self.count + 1;
+        if (!equals(code, "")) {
+            self.linf_count = self.linf_count + 1;
+            if (sev >= 2) { self.linf_errors = self.linf_errors + 1; }
+        }
+    }
+
+    // Worsens the run's exit per RFC §3's mirror. Nonstandard codes (raw
+    // shell signals like 127, or waitstatus debris) rank at 2, the plumbing
+    // plane; a real finc 3 always wins, 2 never swallows it.
+    pub fun worsen(self: &Self, code: int) <noret> {
+        if (code <= 0) { return; }
+        let rank <int> = code;
+        if (rank > 3) { rank = 2; }
+        if (rank == 3) {
+            self.linf_exit = 3;
+            return;
+        }
+        if (rank > self.linf_exit) {
+            self.linf_exit = rank;
+        }
+    }
+}
+
+// Contract severity word for a mapped level; unknown still spells "error"
+// per the contract's unknown-severity rule.
+priv fun sev_word(sev: int) <string> {
+    if (sev == 0) { return "note"; }
+    if (sev == 1) { return "warning"; }
+    return "error";
+}
+
+// Severity map from a JSONL severity spelling; levels follow diag.fin
+// (0 note 1 warning else error).
+priv fun sev_map(sev_text: string) <int> {
+    if (equals(sev_text, "note")) { return 0; }
+    if (equals(sev_text, "warning")) { return 1; }
+    return 2;
+}
+
+// ---- JSONL field extraction (RFC §2 source 3: bounded key-anchored reads) --
+
+// Index of `key` inside bytes[0..end), or -1. Keys are literals so the
+// compare is a char walk; nothing is allocated.
+priv fun find_in(b: [char], end: int, key: string) <int> {
+    let kc <[char]> = to_chars(key);
+    let klen <int> = len(key);
+    let i <int> = 0;
+    while (i + klen <= end) {
+        let j <int> = 0;
+        let hit <int> = 1;
+        while (j < klen) {
+            if (b[i + j] != kc[j]) {
+                hit = 0;
+                j = klen;
+            } else {
+                j = j + 1;
+            }
+        }
+        if (hit == 1) {
+            delete kc;
+            return i;
+        }
+        i = i + 1;
+    }
+    delete kc;
+    return -1;
+}
+
+// The value of `"key":"...."` as a real string: slice the RAW span (opening
+// quote through the escape-aware closing quote) and let json_decode_str own
+// the unescaping. Absent or malformed → "". Caller frees.
+priv fun span_val(b: [char], end: int, key: string) <string> {
+    let hit <int> = find_in(b, end, key);
+    if (hit < 0) { return ""; }
+    let i <int> = hit + len(key);
+    while (i < end && b[i] != '"') { i = i + 1; } // skip to the opening quote
+    if (i >= end) { return ""; }
+    let start <int> = i;
+    i = i + 1;
+    let closed <int> = 0;
+    while (i < end && closed == 0) {
+        if (b[i] == '\\') {
+            i = i + 2;
+        } else if (b[i] == '"') {
+            closed = 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    if (closed == 0) { return ""; }
+    let span <string> = from_chars(b, start, i - start + 1);
+    let dec <Outcome<string>> = json_decode_str(span);
+    free_str(span);
+    if (dec.is_ok()) { return dec.value; }
+    return "";
+}
+
+// The value of `"key":N` as an int; -1 = absent (callers pick defaults:
+// 0 for counts, 0 for line/col).
+priv fun span_int(b: [char], end: int, key: string) <int> {
+    let hit <int> = find_in(b, end, key);
+    if (hit < 0) { return -1; }
+    let i <int> = hit + len(key);
+    while (i < end && b[i] != ':') { i = i + 1; }
+    if (i >= end) { return -1; }
+    i = i + 1;
+    while (i < end && b[i] == ' ') { i = i + 1; }
+    if (i >= end) { return -1; }
+    let neg <int> = 1;
+    if (b[i] == '-') {
+        neg = -1;
+        i = i + 1;
+    }
+    if (i >= end || b[i] < '0' || b[i] > '9') { return -1; }
+    let v <int> = 0;
+    while (i < end && b[i] >= '0' && b[i] <= '9') {
+        v = v * 10 + b[i] - '0';
+        i = i + 1;
+    }
+    return v * neg;
+}
+
+// ---- the JSONL pass: contract forwarding, summaries, and findings -----------
+
+priv fun chew_bytes(run: &Run, b: [char], end: int, contract_mode: int) <noret> {
+    let diag_key <string> = "\"kind\":\"diagnostic\"";
+    let summary_key <string> = "\"kind\":\"summary\"";
+
+    let start <int> = 0;
+    while (start < end) {
+        let e <int> = start;
+        while (e < end && b[e] != '\n') {
+            e = e + 1;
+        }
+        if (e == start) {
+            start = start + 1;
+            continue;
+        }
+
+        let is_sum <int> = 0;
+        if (find_in(b, e, summary_key) >= 0) { is_sum = 1; }
+
+        if (is_sum == 1) {
+            let errs <int> = span_int(b, e, "\"errors\"");
+            let warns <int> = span_int(b, e, "\"warnings\"");
+            if (errs > 0) { run.finc_errors = run.finc_errors + errs; }
+            if (warns > 0) { run.finc_warnings = run.finc_warnings + warns; }
+            // finc's OWN summary is the authoritative exit (contract):
+            // this is how "finished cleanly" vs "died" is known without
+            // trusting the popen waitstatus.
+            let finc_code <int> = span_int(b, e, "\"exitCode\"");
+            if (finc_code >= 0) { run.worsen(finc_code); }
+            run.saw_summary = run.saw_summary + 1;
+        } else if (contract_mode != 0) {
+            // contract format: finc's diagnostics forward VERBATIM (unknown
+            // kinds intact); linf's additions render after the run.
+            let raw <string> = from_chars(b, start, e - start);
+            cli_dprintf(2, "%s\n", raw);
+            free_str(raw);
+        } else if (find_in(b, e, diag_key) >= 0) {
+            let sev <string> = span_val(b, e, "\"severity\"");
+            let msg <string> = span_val(b, e, "\"message\"");
+            let file <string> = span_val(b, e, "\"file\"");
+            let ln <int> = span_int(b, e, "\"line\"");
+            let cl <int> = span_int(b, e, "\"column\"");
+            let use_ln <int> = ln;
+            if (use_ln < 0) { use_ln = 0; }
+            let use_cl <int> = cl;
+            if (use_cl < 0) { use_cl = 0; }
+            run.add(sev_map(sev), "", msg, file, use_ln, use_cl);
+            free_str(sev);
+            free_str(msg);
+            free_str(file);
+        }
+        start = e + 1;
+    }
+}
+
+// ---- the three token rules, proven in fin-sdk's linf_first_rules.fin -------
+
+priv fun lint_source(run: &Run, path: string, text: string) <noret> {
+    // Rule 1: line length (first long line per file, v0 per RFC §4).
+    let chars <[char]> = to_chars(text);
+    let total <int> = len(text);
+    let i <int> = 0;
+    let lineno <int> = 1;
+    let width <int> = 0;
+    let longline <int> = 0;
+    while (i < total) {
+        let c <char> = chars[i];
+        if (c == '\n') {
+            if (width > 100 && longline == 0) {
+                longline = lineno;
+            }
+            width = 0;
+            lineno = lineno + 1;
+        } else {
+            width = width + 1;
+        }
+        i = i + 1;
+    }
+    if (width > 100 && longline == 0) { longline = lineno; }
+    delete chars;
+    if (longline != 0) {
+        run.add(1, "linf:line-length", "line is longer than 100 columns",
+              path, longline, 1);
+    }
+
+    // Rules 2 + 3: one token pass (delete-without-new and unused-import).
+    let l <CdkTokens> = cdk_scan(text);
+    let names <[int]> = new [int, 32]{};
+    let n_names <int> = 0;
+    let after_semi <int> = -1;
+    let has_delete <int> = 0;
+    let has_new <int> = 0;
+    let first_delete_line <int> = 0;
+    let state <int> = 0; // 0 outside, 1 between import and from, 2 after from
+    let j <int> = 0;
+    while (j < l.count) {
+        let k <int> = l.tokens[j].kind;
+        if (k == kw_delete() && has_delete == 0) {
+            has_delete = 1;
+            first_delete_line = l.tokens[j].line;
+        }
+        if (k == kw_new()) { has_new = 1; }
+        if (state == 0) {
+            if (k == kw_import()) { state = 1; }
+        } else if (state == 1) {
+            if (k == kw_from()) {
+                state = 2;
+            } else if (k == tok_ident() && n_names < 32) {
+                names[n_names] = j;
+                n_names = n_names + 1;
+            }
+        } else {
+            if (k == tok_semicolon()) { after_semi = j; state = 0; }
+        }
+        j = j + 1;
+    }
+
+    if (has_delete == 1 && has_new == 0) {
+        run.add(1, "linf:delete-without-new", "delete with no new in this file",
+              path, first_delete_line, 1);
+    }
+
+    let idx <int> = 0;
+    while (idx < n_names) {
+        let ni <int> = names[idx];
+        let used <int> = 0;
+        let m <int> = after_semi + 1;
+        while (m < l.count) {
+            if (l.tokens[m].kind == tok_ident()
+                && equals(l.tokens[ni].text, l.tokens[m].text)) {
+                used = 1;
+            }
+            m = m + 1;
+        }
+        if (used == 0) {
+            let head <string> = concat("import '", l.tokens[ni].text);
+            let msg <string> = concat(head, "' is never used in this file");
+            free_str(head);
+            run.add(1, "linf:unused-import", msg, path, l.tokens[ni].line, 1);
+            free_str(msg);
+        }
+        idx = idx + 1;
+    }
+    delete names;
+
+    free_cdk_tokens(l);
+}
+
+// ---- renderers --------------------------------------------------------------
+
+priv fun write_contract_line(f: &Fnd) <noret> {
+    let enc_msg <string> = json_encode_str(f.message);
+    let enc_code <string> = "";
+    if (equals(f.code, "")) {
+        enc_code = "null";
+    } else {
+        enc_code = json_encode_str(f.code);
+    }
+    let enc_file <string> = "";
+    if (equals(f.file, "")) {
+        enc_file = "null";
+    } else {
+        enc_file = json_encode_str(f.file);
+    }
+    let enc_sev <string> = json_encode_str(sev_word(f.sev));
+    cli_dprintf(2, "{\"kind\":\"diagnostic\",\"severity\":%s,\"code\":%s,\"message\":%s,\"file\":%s,\"line\":%d,\"column\":%d,\"endLine\":%d,\"endColumn\":%d,\"help\":null,\"attribution\":null}\n",
+          enc_sev, enc_code, enc_msg, enc_file, f.line, f.col, f.line, f.col);
+    free_str(enc_msg);
+    if (!equals(f.code, "")) { free_str(enc_code); }
+    if (!equals(f.file, "")) { free_str(enc_file); }
+    free_str(enc_sev);
+}
+
+priv fun write_gcc_line(f: &Fnd) <noret> {
+    if (equals(f.file, "")) {
+        // Location-less diagnostics (finc flag refusals, linf plumbing) have
+        // no gcc-matcher shape; keep them on stderr with the tool named.
+        let tool <string> = "linf";
+        if (equals(f.code, "")) { tool = "finc"; }
+        cli_dprintf(2, "%s: %s: %s\n", tool, sev_word(f.sev), f.message);
+    } else {
+        cli_dprintf(2, "%s:%d:%d: %s: %s\n", f.file, f.line, f.col, sev_word(f.sev), f.message);
+    }
+}
+
+priv fun write_actions_line(f: &Fnd) <noret> {
+    // GitHub annotations know error/warning/notice: note maps to notice.
+    let aword <string> = sev_word(f.sev);
+    if (equals(aword, "note")) { aword = "notice"; }
+    if (equals(f.file, "")) {
+        cli_dprintf(2, "::%s ::%s\n", aword, f.message);
+    } else {
+        cli_dprintf(2, "::%s file=%s,line=%d,col=%d::%s\n", aword, f.file, f.line, f.col, f.message);
+    }
+}
+
+priv fun write_sarif(run: &Run, version: string) <noret> {
+    cli_dprintf(2, "{\"version\":\"2.1.0\",\"$schema\":\"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"linf\",\"version\":\"%s\",\"informationUri\":\"https://github.com/M1778/Linf\",\"rules\":[{\"id\":\"linf:line-length\"},{\"id\":\"linf:unused-import\"},{\"id\":\"linf:delete-without-new\"},{\"id\":\"linf:unchecked-index\"},{\"id\":\"linf:fmt-drift\"}]}},\"results\":[", version);
+    let first <int> = 1;
+    let idx <int> = 0;
+    while (idx < run.count) {
+        let f <Fnd> = run.fnds[idx];
+        if (first == 0) {
+            cli_dprintf(2, ",");
+        }
+        first = 0;
+        let enc_msg <string> = json_encode_str(f.message);
+        if (equals(f.code, "")) {
+            // finc-sourced: no ruleId (tool-agnostic result)
+            cli_dprintf(2, "{\"level\":\"%s\",\"message\":{\"text\":%s}", sev_word(f.sev), enc_msg);
+        } else {
+            let enc_code <string> = json_encode_str(f.code);
+            cli_dprintf(2, "{\"ruleId\":%s,\"level\":\"%s\",\"message\":{\"text\":%s}", enc_code, sev_word(f.sev), enc_msg);
+            free_str(enc_code);
+        }
+        free_str(enc_msg);
+        if (!equals(f.file, "")) {
+            let enc_file <string> = json_encode_str(f.file);
+            cli_dprintf(2, ",\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":%s},\"region\":{\"startLine\":%d,\"startColumn\":%d}}}]", enc_file, f.line, f.col);
+            free_str(enc_file);
+        }
+        cli_dprintf(2, "}");
+        idx = idx + 1;
+    }
+    cli_dprintf(2, "]}]}\n");
+}
+
+// ---- main --------------------------------------------------------------------
+
+fun main() <int> {
+    let cmd <Command> = Command::create("linf",
+          "linter for Fin - finc reports compiler errors, linf reports style warnings");
+    cmd.add_arg("format", 'f', true, "contract",
+          "contract|gcc|actions|sarif (output lane)");
+    cmd.add_arg("finc", '-', true, "finc", "the finc binary to run");
+    let check_sub <&Command> = Command::make_sub("check",
+          "check path(s): linf check [options] <path>...");
+    cmd.sub(check_sub);
+
+    let parsed <Outcome<Match>> = cmd.parse_args();
+    if (!parsed.is_ok()) {
+        // cli.fin reported and carried the problem; surface it verbatim.
+        // The Err's default value holds no arrays, so nothing frees here.
+        cli_dprintf(2, "%s\n", parsed.message);
+        return 2;
+    }
+    let m <Match> = parsed.value;
+
+    let fmt <string> = m.get("format");
+    let format_mode <int> = 0; // 0 contract 1 gcc 2 actions 3 sarif
+    if (equals(fmt, "gcc")) {
+        format_mode = 1;
+    } else if (equals(fmt, "actions")) {
+        format_mode = 2;
+    } else if (equals(fmt, "sarif")) {
+        format_mode = 3;
+    } else if (!equals(fmt, "contract")) {
+        let bad <string> = concat("linf: unknown --format '", fmt);
+        cli_dprintf(2, "%s' (use contract|gcc|actions|sarif)\n", bad);
+        free_str(bad);
+        free_match(m);
+        return 2;
+    }
+
+    let finc_bin <string> = m.get("finc");
+    if (m.pos_count <= 0) {
+        cli_dprintf(2, "linf: no paths given\n");
+        free_match(m);
+        return 2;
+    }
+
+    let run <Run> = Run::create();
+
+    let pi <int> = 0;
+    while (pi < m.pos_count) {
+        let path <string> = m.pos[pi];
+
+        // finc is the source of truth (RFC §1). The capture merges stderr
+        // into the read pipe: finc's stdout is contract-silent here.
+        let base <string> = concat(finc_bin, " \"");
+        let one <string> = concat(base, path);
+        free_str(base);
+        let two <string> = concat(one, "\" --diagnostics=json --color=never 2>&1");
+        free_str(one);
+        let res <ProcessResult> = exec_command(two);
+        free_str(two);
+
+        if (res.exit_code == -1) {
+            run.add(2, "linf:plumbing", "could not run the finc binary", path, 0, 0);
+            run.worsen(2);
+        } else {
+            let raw_text <string> = res.output;
+            let total <int> = len(raw_text);
+
+            let saw_before <int> = run.saw_summary;
+            let contract <int> = 0;
+            if (format_mode == 0) { contract = 1; }
+            let usable <[char]> = to_chars(raw_text);
+            chew_bytes(&run, usable, total, contract);
+            delete usable;
+
+            // No summary this path: finc died before reporting. The popen
+            // waitstatus decodes as the fallback (low byte nonzero = signal
+            // kill = compiler failure; shell 127-normalized = plumbing).
+            if (run.saw_summary == saw_before) {
+                let st <int> = res.exit_code;
+                let high <int> = st / 256;
+                let rem <int> = st - high * 256;
+                if (rem != 0) {
+                    run.worsen(3);
+                } else {
+                    run.worsen(high);
+                }
+            }
+
+            // The rules (RFC §4) only when the source itself is readable; an
+            // unreadable path already reached finc (its exit 2 propagates).
+            if (res.exit_code != 2) {
+                let src? <string> = read_to_string(path);
+                if (src != null) {
+                    lint_source(&run, path, src?);
+                    free_file_content(src);
+                }
+            }
+        }
+        free_process_result(res);
+
+        pi = pi + 1;
+    }
+
+    // A missing summary is a plumbing failure (RFC §1): finc died before
+    // reporting. The contract guarantees exactly one summary per run,
+    // including on exit 2 and 3.
+    if (run.saw_summary <= 0) {
+        run.add(2, "linf:plumbing", "finc produced no summary line", "", 0, 0);
+        run.worsen(2);
+    }
+
+    // Findings worsen the exit per the mirror: anything user-facing fires 1.
+    if (run.count > 0 && run.linf_exit == 0) {
+        run.linf_exit = 1;
+    }
+
+    if (format_mode == 0) {
+        // linf-owned lines only; finc's own already streamed verbatim above.
+        let i <int> = 0;
+        while (i < run.count) {
+            let f <Fnd> = run.fnds[i];
+            if (!equals(f.code, "")) {
+                write_contract_line(&run.fnds[i]);
+            }
+            i = i + 1;
+        }
+    } else if (format_mode == 1) {
+        let i <int> = 0;
+        while (i < run.count) {
+            write_gcc_line(&run.fnds[i]);
+            i = i + 1;
+        }
+    } else if (format_mode == 2) {
+        let i <int> = 0;
+        while (i < run.count) {
+            write_actions_line(&run.fnds[i]);
+            i = i + 1;
+        }
+    } else {
+        write_sarif(&run, "3.0.0");
+    }
+
+    // Exactly one summary — except the SARIF lane, whose document is the
+    // terminal artifact: SARIF consumers choke on a trailing JSONL line, so
+    // the document itself closes the stream (RFC §3).
+    let status <string> = "ok";
+    if (run.linf_exit > 0) { status = "failed"; }
+    if (format_mode != 3) {
+        let total_warns <int> = run.finc_warnings + (run.linf_count - run.linf_errors);
+        cli_dprintf(2, "{\"kind\":\"summary\",\"errors\":%d,\"warnings\":%d,\"exitCode\":%d,\"status\":\"%s\"}\n",
+              run.finc_errors + run.linf_errors, total_warns, run.linf_exit, status);
+    }
+
+    // Ownership: every entry's strings were cloned at add time.
+    let i <int> = 0;
+    while (i < run.count) {
+        free_str(run.fnds[i].code);
+        free_str(run.fnds[i].message);
+        free_str(run.fnds[i].file);
+        i = i + 1;
+    }    delete run.fnds;
+    free_match(m);
+
+    return run.linf_exit;
+}

@@ -1,0 +1,10 @@
+import { read_to_string, free_file_content } from fs::std;
+
+// fixture_ok: clean — compile true, no lint findings.
+fun main() <noret> {
+    let src? <string> = read_to_string("fixture_ok.fin");
+    if (src != null) {
+        printf("%d\n", src != null);
+        free_file_content(src);
+    }
+}

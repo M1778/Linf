@@ -1,0 +1,11 @@
+import { read_to_string } from fs::std;
+import { to_chars } from strings::std;
+import { printf } from stdio::std;
+
+let long_non_compliant_line <int> = 0; // this filler comment drags the line past the 100-column limit so the line-length rule fires
+
+fun main() <noret> {
+    let junk <[char]> = to_chars("quadtestbuffer");
+    delete junk;
+    printf("done\n");
+}
