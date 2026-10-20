@@ -23,9 +23,9 @@ binary is real and shipped in this repo, written **in Fin** against the
   finc src/linf.fin -o linf --fin-libs /path/to/fin-sdk/lib
   ./linf check path/to/your.fin --format gcc
   ```
-- **Rules status**: line-length / unused-import / delete-without-new shipped;
-  unchecked-index planned; `fmt-drift` blocked until `finfmt --check`'s exit
-  code is drift-truthful (RFC §4 records the probe).
+- **Rules status**: line-length / unused-import / delete-without-new /
+  unchecked-index shipped (four of five); `fmt-drift` blocked until
+  `finfmt --check`'s exit code is drift-truthful (RFC §4 records the probe).
 - **Contract** — plumbing pinned to the finc machine contract v3
   (`kFincContractVersion`); `VERSION` major tracks it, same policy as
   `fin-sdk` (currently 3.0.0).

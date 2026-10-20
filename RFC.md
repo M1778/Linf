@@ -120,7 +120,7 @@ what consumers trust, per the contract.
 | line length > 100 | `linf:line-length` | warning | raw lines | **shipped** (linf v0 binary; proven earlier in fin-sdk) |
 | unused import | `linf:unused-import` | warning | scanner (name never spelled after its import) | **shipped** (linf v0 binary; finc emits no unused-import fact, so this is linf's own) |
 | `delete` without `new` | `linf:delete-without-new` | warning | scanner (file says `delete`, never `new`) | **shipped** (linf v0 binary; v0 file-level) |
-| unchecked index without `blame` | `linf:unchecked-index` | warning | scanner (bracket-index in a file with no `blame`); honest wording until a semantic pass exists | planned |
+| unchecked index without `blame` | `linf:unchecked-index` | warning | scanner: a postfix bracket (`expr[...]` — ident/`)`/`]`/literal before it, never type/`new` spellings) in a file with no `blame` token at all; honest wording until a semantic pass exists | **shipped** (linf v0 binary; v0 file-level) |
 | `fin fmt` drift | `linf:fmt-drift` | warning | subprocess byte-compare vs `finfmt` | **blocked on `finfmt`**: its `--check` exits `0` on drift today (evidence below) |
 
 Non-goals v0: no autofixes, no per-project config files (thresholds frozen
@@ -180,6 +180,10 @@ from `src/linf.fin` against `fin-sdk` 3.2.0):
   `ruleId`/`level`/`region` correct; on the clean fixture: `results: []`,
   exit 0; no trailing summary line in the document.
 - `--format actions`: `::warning file=fixture_linted.fin,line=5,col=1::...`.
+- `linf check fixture_indexed.fin` (postfix `chars[i]`, no `blame` anywhere)
+  → exactly one finding `linf:unchecked-index` @7:1, exit 1,
+  summary `warnings:1 exitCode:1`; the same shape WITH a `blame` line
+  (`fixture_blamed.fin`) → clean, exit 0, no finding.
 - multi-path `check ok bad linted` → one combined summary
   `errors:1 warnings:3`.
 - usage planes: unknown format → `linf: unknown --format

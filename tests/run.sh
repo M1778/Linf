@@ -51,9 +51,17 @@ run fixture_bad.fin
 grep -qF "expected ';'\"" "$OUT" && pass "bad-forward" || defy "bad-forward"
 grep -qF '"errors":1' "$OUT" && grep -qF '"exitCode":1,"status":"failed"' "$OUT" && pass "bad-summary" || defy "bad-summary"
 
+# 3b. rule 4: bracket-index fires only in a blame-free file
+run fixture_indexed.fin
+[ "$RC" -eq 1 ] && pass "indexed-rc" || defy "indexed-rc:$RC"
+grep -qF '"code":"linf:unchecked-index","message":"indexing without blame in this file","file":"fixture_indexed.fin","line":7' "$OUT" && pass "rule-unchecked-index" || defy "rule-unchecked-index"
+grep -qF '"warnings":1,"exitCode":1' "$OUT" && pass "indexed-summary" || defy "indexed-summary"
+run fixture_blamed.fin
+[ "$RC" -eq 0 ] && pass "blamed-clean" || defy "blamed-clean:$RC"
+grep -qF 'unchecked-index' "$OUT" && defy "blamed-fires-wrongly" || pass "blamed-silent"
+
 # 4. gcc lane: matcher-shaped first line
-run --format gcc fixture_linted.fin
-grep -qF "fixture_linted.fin:5:1: warning: line is longer than 100 columns" "$OUT" && pass "gcc-lane" || defy "gcc-lane"
+run --format gcc fixture_linted.fingrep -qF "fixture_linted.fin:5:1: warning: line is longer than 100 columns" "$OUT" && pass "gcc-lane" || defy "gcc-lane"
 [ ! -s "$HERE/.stdout" ] || defy "gcc-stdout-silent"
 
 # 5. actions lane: annotation commands (consume the whole log)

@@ -28,7 +28,9 @@ import { read_to_string, free_file_content } from fs::std;
 import { ProcessResult, exec_command, free_process_result } from process::std;
 import { Command, Match, Outcome, free_match } from cli::std;
 import { CdkTokens, cdk_scan, free_cdk_tokens } from cdk::std;
-import { tok_ident, tok_semicolon, kw_import, kw_from, kw_new, kw_delete } from token::std;
+import { tok_ident, tok_semicolon, tok_lbracket, tok_rbracket, tok_rparen,
+      tok_int_lit, tok_float_lit, tok_string_lit, tok_char_lit,
+      kw_import, kw_from, kw_new, kw_delete, kw_blame } from token::std;
 import { len, to_chars, from_chars, equals, concat, clone, free_str } from strings::std;
 import { json_encode_str, json_decode_str } from json::std;
 import { cli_dprintf } from cli::std;
@@ -293,6 +295,8 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
     let has_new <int> = 0;
     let first_delete_line <int> = 0;
     let state <int> = 0; // 0 outside, 1 between import and from, 2 after from
+    let first_index_line <int> = 0;
+    let has_blame <int> = 0;
     let j <int> = 0;
     while (j < l.count) {
         let k <int> = l.tokens[j].kind;
@@ -301,6 +305,19 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
             first_delete_line = l.tokens[j].line;
         }
         if (k == kw_new()) { has_new = 1; }
+        if (k == kw_blame()) { has_blame = 1; }
+        // Rule 4 (v0 file-level per RFC §4): a POSTFIX bracket — the index
+        // operation `expr[...]`, never the type/`new` bracket spellings — in
+        // a file that carries no `blame` at all.
+        if (k == tok_lbracket() && j > 0 && first_index_line == 0) {
+            let prev <int> = l.tokens[j - 1].kind;
+            if (prev == tok_ident() || prev == tok_rparen()
+                || prev == tok_rbracket() || prev == tok_int_lit()
+                || prev == tok_float_lit() || prev == tok_string_lit()
+                || prev == tok_char_lit()) {
+                first_index_line = l.tokens[j].line;
+            }
+        }
         if (state == 0) {
             if (k == kw_import()) { state = 1; }
         } else if (state == 1) {
@@ -319,6 +336,10 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
     if (has_delete == 1 && has_new == 0) {
         run.add(1, "linf:delete-without-new", "delete with no new in this file",
               path, first_delete_line, 1);
+    }
+    if (first_index_line != 0 && has_blame == 0) {
+        run.add(1, "linf:unchecked-index", "indexing without blame in this file",
+              path, first_index_line, 1);
     }
 
     let idx <int> = 0;

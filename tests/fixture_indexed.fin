@@ -1,0 +1,8 @@
+import { to_chars } from strings::std;
+import { printf } from stdio::std;
+
+fun main() <noret> {
+    let chars <[char]> = to_chars("quad");
+    let i <int> = 0;
+    if (chars[i] == 'q') { printf("quad\n"); }
+}
