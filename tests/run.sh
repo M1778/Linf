@@ -20,8 +20,6 @@ pass build
 # everything runs from the fixture dir so pinned lines/patterns hold
 cd "$HERE"
 
-linf() { "$BIN"$' \c' check >/dev/null 2>&1; }  # placeholder never used
-
 run() { # run <lane...> into .out/.rc; stderr = lane output, stdout = silence
   OUT="$HERE/.out"; RC=0
   "$BIN" check --finc "$FINC" "$@" 2>"$OUT" 1>"$HERE/.stdout"
@@ -61,7 +59,8 @@ run fixture_blamed.fin
 grep -qF 'unchecked-index' "$OUT" && defy "blamed-fires-wrongly" || pass "blamed-silent"
 
 # 4. gcc lane: matcher-shaped first line
-run --format gcc fixture_linted.fingrep -qF "fixture_linted.fin:5:1: warning: line is longer than 100 columns" "$OUT" && pass "gcc-lane" || defy "gcc-lane"
+run --format gcc fixture_linted.fin
+grep -qF "fixture_linted.fin:5:1: warning: line is longer than 100 columns" "$OUT" && pass "gcc-lane" || defy "gcc-lane"
 [ ! -s "$HERE/.stdout" ] || defy "gcc-stdout-silent"
 
 # 5. actions lane: annotation commands (consume the whole log)
