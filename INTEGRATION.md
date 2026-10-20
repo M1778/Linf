@@ -18,7 +18,7 @@ lane:
       "command": "linf",
       "args": ["check", "--finc", "finc", "--format", "gcc", "${file}"],
       "options": { "cwd": "${workspaceFolder}" },
-      "problemMatcher": { "$": "$gcc" },
+      "problemMatcher": "$gcc",
       "group": { "kind": "lint" },
       "presentation": { "reveal": "silent", "clear": true, "panel": "dedicated" }
     }

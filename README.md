@@ -12,10 +12,11 @@ binary is real and shipped in this repo, written **in Fin** against the
   "$gcc"` on the `gcc` lane), Neovim (`errorformat`), GitHub Actions annotations,
   GitHub code scanning + SARIF viewers, and the LSP story (`finls` wrapper).
 - **Status — v0 shipped**: `src/linf.fin` builds into the `linf` binary with
-  four output lanes (`contract`/`gcc`/`actions`/sarif), the three scanner
-  rules + line length live, the exit-code mirror holds
+  four output lanes (`contract`/`gcc`/`actions`/`sarif`), all on stderr; the
+  three scanner rules + line length live, the exit-code mirror holds
   (0 clean · 1 findings · 2 usage/plumbing · 3 finc failure propagated), and
-  `tests/run.sh` pins all 23 self-check behaviors.
+  `tests/run.sh` pins all 28 self-check behaviors. `finn` packaging
+  (RFC §5 stage 4) is still pending.
 - **Try it**:
   ```sh
   FINC=/path/to/finc SDK_LIB=/path/to/fin-sdk/lib tests/run.sh

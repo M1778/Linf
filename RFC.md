@@ -1,12 +1,11 @@
 # RFC: Linf — the Fin linter
 
-Status: **draft, scaffolded** · Binary name: `linf` (approved, #50 §4) · Repo:
+Status: **v0 shipped** · Binary name: `linf` (approved, #50 §4) · Repo:
 this one (`M1778/Linf`) · Plumbing contract: `finc` machine contract v3
 (`docs/finc-interface-contract.md`, `kFincContractVersion = 3`)
 
 Linf = linter for Fin. **`finc` reports compiler errors; Linf reports style
-warnings** — the same source, a different layer, never a second implementation
-of the language.
+warnings** — the same source, a different layer.
 
 ## 1. Architecture (the one non-negotiable rule)
 
@@ -68,7 +67,7 @@ Ranked, most contract-true first:
 ```
 linf check [--format <lane>] [--finc <bin>] <path>...   # the only subcommand in v0
 linf --help                                             # stdout, exit 0
-linf --version  →  "linf <semver> (contract <int>)"     # stdout, exit 0
+linf --version  →  "linf"                               # stdout, exit 0
 ```
 
 Options spell two tokens (`--format gcc`), following cli.fin's grammar —
@@ -121,7 +120,7 @@ what consumers trust, per the contract.
 | unused import | `linf:unused-import` | warning | scanner (name never spelled after its import) | **shipped** (linf v0 binary; finc emits no unused-import fact, so this is linf's own) |
 | `delete` without `new` | `linf:delete-without-new` | warning | scanner (file says `delete`, never `new`) | **shipped** (linf v0 binary; v0 file-level) |
 | unchecked index without `blame` | `linf:unchecked-index` | warning | scanner: a postfix bracket (`expr[...]` — ident/`)`/`]`/literal before it, never type/`new` spellings) in a file with no `blame` token at all; honest wording until a semantic pass exists | **shipped** (linf v0 binary; v0 file-level) |
-| `fin fmt` drift | `linf:fmt-drift` | warning | subprocess byte-compare vs `finfmt` | **blocked on `finfmt`**: its `--check` exits `0` on drift today (evidence below) |
+| `fin fmt` drift | `linf:fmt-drift` | warning | subprocess via `finfmt --check` | **pending** — `finfmt --check` ships in Fin now: exit `1` with a diff on whitespace drift (indent, tab indent, trailing WS probed); it deliberately skips intra-line spacing (evidence below) — and the rule's subprocess wiring did not land in v0 |
 
 Non-goals v0: no autofixes, no per-project config files (thresholds frozen
 here until a ruling), no parallel jobs, no finn packaging (that waits for the
@@ -129,17 +128,18 @@ registry).
 
 ## 5. Stages
 
-1. **RFC + scaffold** — done (previous commit): contract v3 pinned, evidence gathered.
+1. **RFC + scaffold** — done (`b74f3a0`): contract v3 pinned, evidence gathered.
 2. **Rules stage** — done in the same landing: the three scanner rules and
-   line length live in `src/linf.fin` (still written in Fin against the SDK
-   bundle, which grew `cli`, `process`, `json`, `hashmap` at 3.1/3.2.0 to
-   carry them).
-3. **Binary stage** — done at v0: `src/linf.lin`?
+   line length live in `src/linf.fin` (written in Fin against the fin-sdk
+   bundle, which grew `cli`, `process`, `json`, `hashmap` by 3.2.0 to carry
+   them).
+3. **Binary stage** — done at v0 (`a846ab2`, rule 4 at `697e2b0`):
    `src/linf.fin` builds into the `linf` binary; four lanes, exit mirror,
-   stream discipline, multi-path totals — all pinned by `tests/run.sh`.
-4. **Package stage** — `finn` packaging once the registry supports it.
+   stream discipline, multi-path totals — all pinned by the 28 asserts in
+   `tests/run.sh`.
+4. **Package stage** — pending: `finn` packaging once the registry supports it.
 
-Stages 2–4 land as `linf` work in this repo; each lands only with tests that
+Stages 1–3 are done, stage 4 is pending. Each landing arrives with tests that
 run against a real `build/finc`.
 
 ## 6. Versioning
@@ -154,15 +154,16 @@ but the unknown-kind/severity rules above keep it *forward-tolerant*.
 - `finc ok.fin --diagnostics=json --color=never` → exit 0, stderr exactly
   `{"kind":"summary","errors":0,"warnings":0,"exitCode":0,"status":"ok"}`,
   stdout empty, **no build artifacts left in cwd**.
-- `finc bad.fin --diagnostics=json --color=never` (missing `;`) → exit 1 with
+- `finc bad.fin --diagnostics=json --color=never` (a `;` only after the
+  closing brace, as reproduced by `tests/fixture_bad.fin`) → exit 1 with
   an error diagnostic carrying `file/line/column/endLine/endColumn` + summary
   `status:"failed"` — the shape Linf appends to, verbatim key set.
 - `-o` + `--diagnostics=json` → the contract's refusal diagnostic + summary
   `exitCode: 2`, as documented.
-- `finfmt --check` currently exits `0` even on drifted spellings (e.g.
-  `fun main ()` spacing) — so rule 5's "planned" status is graded on
-  that, not on optimism; `finfmt` is invoked from `process::std` when the
-  check mode is real.
+- `finfmt --check` (shipped in Fin) exits `1` with a unified diff on
+  whitespace drift — indentation and tab indent are the probed cases;
+  intra-line spacing stays `0`, skipped on purpose in the formatter's canon.
+  Rule 5's wiring rides `process::std` when it lands.
 
 Evidence of the v0 binary (all at Fin `a6b4b67`, contract 3, `linf` built
 from `src/linf.fin` against `fin-sdk` 3.2.0):
@@ -177,7 +178,8 @@ from `src/linf.fin` against `fin-sdk` 3.2.0):
   expected ';'` (the escaped `';'` unescaped through `json_decode_str`);
   exit 1, summary `errors:1`.
 - `--format sarif` on the linted fixture: 5 rules declared, 3 results with
-  `ruleId`/`level`/`region` correct; on the clean fixture: `results: []`,
+  `ruleId`/`level`/`region` correct (`region` inside
+  `locations[0].physicalLocation`); on the clean fixture: `results: []`,
   exit 0; no trailing summary line in the document.
 - `--format actions`: `::warning file=fixture_linted.fin,line=5,col=1::...`.
 - `linf check fixture_indexed.fin` (postfix `chars[i]`, no `blame` anywhere)
@@ -193,10 +195,13 @@ from `src/linf.fin` against `fin-sdk` 3.2.0):
 
 ## 8. IDE + CI integration
 
-`INTEGRATION.md` carries copy-paste harnesses: VS Code `tasks.json` with the
-`$gcc` matcher (works today; `fin-vscode` ships it natively once its grammar
-lands per #50), Neovim `makeprg`/`errorformat`, GitHub Actions annotation
-runs, GitHub code scanning via the SARIF lane, and SARIF viewers (VS Code /
-JetBrains plugins). `linf` stays CLI on purpose — editors get native
-diagnostics through the `finls` LSP wrapper (#50 §5), and the editor-side
-extension is owned by `fin-vscode` (#50 §1/§7).
+`INTEGRATION.md` carries the copy-paste harnesses: a VS Code `tasks.json`
+task on the `gcc` lane (`problemMatcher: "$gcc"`, and `fin-vscode` ships a
+native extension once its grammar lands per #50), Neovim
+`makeprg`/`errorformat`, GitHub Actions annotation runs, GitHub code
+scanning via the SARIF lane, and SARIF viewers (VS Code / JetBrains
+plugins).
+
+`linf` stays a plain CLI by design. Editors get native diagnostics through
+the `finls` LSP wrapper (#50 §5), which parses the `contract` lane; the
+editor-side extension itself is owned by `fin-vscode` (#50 §1/§7).
