@@ -1,0 +1,106 @@
+name: self-check
+
+# The chain: Fin@cite (the same cite fin-sdk's MANIFEST.md pins) -> finc ->
+# linf binary -> the 28-assert self-check. Nothing here compiles with a fast
+# path: finc is built through Fin's own build.sh, the machine contract v3
+# binary the runtime contract expects.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-self-kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # The bundle carries the manifest cite; Fin is checked out at exactly
+      # that ref, so linf always builds against the bundle's own source of
+      # truth and the two lanes cannot drift apart silently.
+      - name: Checkout fin-sdk bundle
+        uses: actions/checkout@v4
+        with:
+          repository: M1778/fin-sdk
+          ref: main
+          path: sdk
+
+      - name: Read the bundle's manifest cite
+        run: |
+          cite="$(sed -n 's/.*`\([0-9a-f]\{40\}\)`.*/\1/p' sdk/MANIFEST.md)"
+          case "$cite" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) : ;;
+            *) echo "::error::sdk/MANIFEST.md names no 40-hex Fin commit"; exit 1 ;;
+          esac
+          echo "Fin cite from sdk manifest: $cite"
+          echo "FIN_CITE=$cite" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: M1778/Fin
+          ref: ${{ env.FIN_CITE }}
+          path: fin
+
+      - name: The cite landed
+        run: |
+          got="$(git -C fin rev-parse HEAD)"
+          echo "Fin checkout is at $got"
+          [ "$got" = "$FIN_CITE" ] || { echo "::error::requested $FIN_CITE, got $got"; exit 1; }
+
+      # --- finc toolchain (Linux subset of Fin's .github/actions/setup-toolchain) ---
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Python build tools
+        run: |
+          uv tool install "conan>=2.4,<3"
+          uv tool install ninja
+
+      - name: Install bison and flex
+        run: |
+          retry() { local n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; sleep $((n*10)); done; }
+          retry sudo apt-get update
+          retry sudo apt-get install -y bison flex
+
+      - name: Install LLVM 22
+        run: |
+          retry() { local n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; sleep $((n*10)); done; }
+          codename="$(lsb_release -cs)"
+          major="$(sed -n 's/^set(FIN_LLVM_MAJOR \([0-9][0-9]*\) CACHE STRING.*/\1/p' fin/CMakeLists.txt)"
+          echo "LLVM major pin: $major"
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-$major main" \
+            | sudo tee "/etc/apt/sources.list.d/llvm-$major.list"
+          retry sudo apt-get update
+          retry sudo apt-get install -y "llvm-$major-dev" "llvm-$major"
+          echo "/usr/lib/llvm-$major/bin" >> "$GITHUB_PATH"
+
+      - name: Build finc through its own build.sh
+        run: (cd fin && ./build.sh --release --no-test)
+
+      - name: finc answers
+        run: |
+          version="$(fin/build/finc --version)"
+          echo "finc --version -> $version"
+          case "$version" in
+            finc\ *) ;;
+            *) echo "::error::--version printed '$version', not 'finc ...'"; exit 1 ;;
+          esac
+
+      # --- linf ---
+      - name: Build linf against the bundle
+        run: fin/build/finc src/linf.fin -o linf --fin-libs "$GITHUB_WORKSPACE/sdk/lib"
+
+      - name: Self-check (28 asserts)
+        run: FINC="$GITHUB_WORKSPACE/fin/build/finc" SDK_LIB="$GITHUB_WORKSPACE/sdk/lib" bash tests/run.sh
