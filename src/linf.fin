@@ -35,7 +35,7 @@ import { tok_ident, tok_semicolon, tok_lbracket, tok_rbracket, tok_rparen,
 import { Buffer, new_buffer, free_buffer } from buffer::std;
 import { len, to_chars, from_chars, equals, concat, clone, free_str } from strings::std;
 import { json_decode_str } from json::std;
-import { cli_dprintf } from cli::std;
+import { eprint_str, eprintln_str } from stdio::std;
 
 // A finding in the contract's field set, renderer-agnostic: linf-owned
 // findings carry `code` ("linf:<rule>"); finc-sourced ones do not, because
@@ -419,7 +419,7 @@ priv fun chew_bytes(run: &Run, b: [char], end: int, contract_mode: int, path: st
         if (!rec.valid) { broken = true; }
         else if (contract_mode != 0 && !equals(kind, "summary")) {
             let raw <string> = from_chars(b, start, e - start);
-            cli_dprintf(2, "%s\n", raw);
+            eprintln_str(raw);
             free_str(raw);
         }
         free_str(kind);
@@ -682,8 +682,25 @@ priv fun write_contract_line(f: &Fnd) <noret> {
         enc_file = json_encode_str(f.file);
     }
     let enc_sev <string> = json_encode_str(sev_word(f.sev));
-    cli_dprintf(2, "{\"kind\":\"diagnostic\",\"severity\":%s,\"code\":%s,\"message\":%s,\"file\":%s,\"line\":%d,\"column\":%d,\"endLine\":%d,\"endColumn\":%d,\"help\":null,\"attribution\":null}\n",
-          enc_sev, enc_code, enc_msg, enc_file, f.line, f.col, f.line, f.col);
+    let record <string> = concat("{\"kind\":\"diagnostic\",\"severity\":", enc_sev);
+    let with_code <string> = concat(record, concat(",\"code\":", enc_code));
+    let with_msg <string> = concat(with_code, concat(",\"message\":", enc_msg));
+    let with_file <string> = concat(with_msg, concat(",\"file\":", enc_file));
+    let with_line <string> = concat(with_file, concat(",\"line\":", itoa(f.line)));
+    let with_col <string> = concat(with_line, concat(",\"column\":", itoa(f.col)));
+    let with_end <string> = concat(with_col, concat(",\"endLine\":", itoa(f.line)));
+    let with_endcol <string> = concat(with_end, concat(",\"endColumn\":", itoa(f.col)));
+    let full <string> = concat(with_endcol, ",\"help\":null,\"attribution\":null}");
+    eprintln_str(full);
+    free_str(full);
+    free_str(with_endcol);
+    free_str(with_end);
+    free_str(with_col);
+    free_str(with_line);
+    free_str(with_file);
+    free_str(with_msg);
+    free_str(with_code);
+    free_str(record);
     free_str(enc_msg);
     if (!equals(f.code, "")) { free_str(enc_code); }
     if (!equals(f.file, "")) { free_str(enc_file); }
@@ -696,9 +713,21 @@ priv fun write_gcc_line(f: &Fnd) <noret> {
         // no gcc-matcher shape; keep them on stderr with the tool named.
         let tool <string> = "linf";
         if (equals(f.code, "")) { tool = "finc"; }
-        cli_dprintf(2, "%s: %s: %s\n", tool, sev_word(f.sev), f.message);
+        let sev <string> = sev_word(f.sev);
+        let line <string> = concat(tool, concat(": ", sev));
+        let full <string> = concat(line, concat(": ", f.message));
+        eprintln_str(full);
+        // sev_word returns a literal: borrowed, not freed.
+        free_str(full); free_str(line);
     } else {
-        cli_dprintf(2, "%s:%d:%d: %s: %s\n", f.file, f.line, f.col, sev_word(f.sev), f.message);
+        let sev <string> = sev_word(f.sev);
+        let head <string> = concat(f.file, concat(":", itoa(f.line)));
+        let with_col <string> = concat(head, concat(":", itoa(f.col)));
+        let with_sev <string> = concat(with_col, concat(": ", sev));
+        let full <string> = concat(with_sev, concat(": ", f.message));
+        eprintln_str(full);
+        // sev_word returns a literal: borrowed, not freed.
+        free_str(full); free_str(with_sev); free_str(with_col); free_str(head);
     }
 }
 
@@ -707,41 +736,108 @@ priv fun write_actions_line(f: &Fnd) <noret> {
     let aword <string> = sev_word(f.sev);
     if (equals(aword, "note")) { aword = "notice"; }
     if (equals(f.file, "")) {
-        cli_dprintf(2, "::%s ::%s\n", aword, f.message);
+        let head <string> = concat("::", aword);
+        let full <string> = concat(head, concat(" ::", f.message));
+        eprintln_str(full);
+        free_str(full); free_str(head);
     } else {
-        cli_dprintf(2, "::%s file=%s,line=%d,col=%d::%s\n", aword, f.file, f.line, f.col, f.message);
+        let head <string> = concat("::", aword);
+        let with_file <string> = concat(head, concat(" file=", f.file));
+        let with_line <string> = concat(with_file, concat(",line=", itoa(f.line)));
+        let with_col <string> = concat(with_line, concat(",col=", itoa(f.col)));
+        let full <string> = concat(with_col, concat("::", f.message));
+        eprintln_str(full);
+        free_str(full); free_str(with_col); free_str(with_line); free_str(with_file); free_str(head);
     }
 }
 
 priv fun write_sarif(run: &Run, version: string) <noret> {
-    cli_dprintf(2, "{\"version\":\"2.1.0\",\"$schema\":\"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"linf\",\"version\":\"%s\",\"informationUri\":\"https://github.com/M1778/Linf\",\"rules\":[{\"id\":\"linf:line-length\"},{\"id\":\"linf:unused-import\"},{\"id\":\"linf:delete-without-new\"},{\"id\":\"linf:unchecked-index\"},{\"id\":\"linf:fmt-drift\"}]}},\"results\":[", version);
+    let head <string> = concat("{\"version\":\"2.1.0\",\"$schema\":\"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"linf\",\"version\":\"", version);
+    let head2 <string> = concat(head, "\",\"informationUri\":\"https://github.com/M1778/Linf\",\"rules\":[{\"id\":\"linf:line-length\"},{\"id\":\"linf:unused-import\"},{\"id\":\"linf:delete-without-new\"},{\"id\":\"linf:unchecked-index\"},{\"id\":\"linf:fmt-drift\"}]}},\"results\":[");
+    eprint_str(head2);
+    free_str(head2); free_str(head);
     let first <int> = 1;
     let idx <int> = 0;
     while (idx < run.size()) {
         let f <Fnd> = *run.at(idx);
         if (first == 0) {
-            cli_dprintf(2, ",");
+            eprint_str(",");
         }
         first = 0;
         let enc_msg <string> = json_encode_str(f.message);
         if (equals(f.code, "")) {
             // finc-sourced: no ruleId (tool-agnostic result)
-            cli_dprintf(2, "{\"level\":\"%s\",\"message\":{\"text\":%s}", sev_word(f.sev), enc_msg);
+            let sev <string> = sev_word(f.sev);
+            let part <string> = concat("{\"level\":\"", sev);
+            let part2 <string> = concat(part, concat("\",\"message\":{\"text\":", enc_msg));
+            // The message object closes here; the locations key is a sibling
+            // of it, not a child.
+            let part3 <string> = concat(part2, "}");
+            eprint_str(part3);
+            // sev_word returns a literal: borrowed, not freed.
+            free_str(part3); free_str(part2); free_str(part);
         } else {
             let enc_code <string> = json_encode_str(f.code);
-            cli_dprintf(2, "{\"ruleId\":%s,\"level\":\"%s\",\"message\":{\"text\":%s}", enc_code, sev_word(f.sev), enc_msg);
+            let sev <string> = sev_word(f.sev);
+            let part <string> = concat("{\"ruleId\":", enc_code);
+            let part2 <string> = concat(part, concat(",\"level\":\"", sev));
+            let part3 <string> = concat(part2, concat("\",\"message\":{\"text\":", enc_msg));
+            let part4 <string> = concat(part3, "}");
+            eprint_str(part4);
+            // sev_word returns a literal: borrowed, not freed.
+            free_str(part4); free_str(part3); free_str(part2); free_str(part);
             free_str(enc_code);
         }
         free_str(enc_msg);
         if (!equals(f.file, "")) {
             let enc_file <string> = json_encode_str(f.file);
-            cli_dprintf(2, ",\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":%s},\"region\":{\"startLine\":%d,\"startColumn\":%d}}}]", enc_file, f.line, f.col);
+            // One string, so the braces are counted once and read once:
+            //   locations[ -> physicalLocation{ -> artifactLocation{ -> uri
+            //   then region{ -> startLine, startColumn
+            // then close region, artifactLocation and physicalLocation, and
+            // the locations array element: three braces and a bracket.
+            //
+            // region is a child of artifactLocation, so artifactLocation stays
+            // open until region has been written.
+            let open <string> = concat(",\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":", enc_file);
+            let region <string> = concat(open, concat("},\"region\":{\"startLine\":", itoa(f.line)));
+            let region2 <string> = concat(region, concat(",\"startColumn\":", itoa(f.col)));
+            // Close region, artifactLocation and physicalLocation, then the
+            // locations array element: three braces and a bracket.
+            let part4 <string> = concat(region2, "}}}]");
+            free_str(region2); free_str(region); free_str(open);
+            eprint_str(part4);
+            free_str(part4);
             free_str(enc_file);
         }
-        cli_dprintf(2, "}");
+        eprint_str("}");
         idx = idx + 1;
     }
-    cli_dprintf(2, "]}]}\n");
+    eprintln_str("]}]}");
+}
+
+// Decimal digits for an int, as a fresh string the caller frees.
+priv fun itoa(value: int) <string> {
+    if (value == 0) { return concat("0", ""); }
+    let negative <bool> = value < 0;
+    let rest <int> = value;
+    if (negative) { rest = -value; }
+    let digits <[char]> = new [char, 24]{};
+    let count <int> = 0;
+    while (rest > 0 && count < 24) {
+        digits[count] = cast<char>(cast<int>('0') + rest % 10);
+        count = count + 1;
+        rest = rest / 10;
+    }
+    let text <string> = "";
+    if (negative) { text = concat("-", ""); }
+    for (let i <int> = count - 1; i >= 0; i--) {
+        let piece <string> = from_chars(digits, i, 1);
+        text = concat(text, piece);
+        free_str(piece);
+    }
+    delete digits;
+    return text;
 }
 
 // ---- main --------------------------------------------------------------------
@@ -760,7 +856,7 @@ fun main() <int> {
     if (!parsed.is_ok()) {
         // cli.fin reported and carried the problem; surface it verbatim.
         // The Err's default value holds no arrays, so nothing frees here.
-        cli_dprintf(2, "%s\n", parsed.message);
+        eprintln_str(parsed.message);
         return 2;
     }
     let m <Match> = parsed.value;
@@ -775,7 +871,9 @@ fun main() <int> {
         format_mode = 3;
     } else if (!equals(fmt, "contract")) {
         let bad <string> = concat("linf: unknown --format '", fmt);
-        cli_dprintf(2, "%s' (use contract|gcc|actions|sarif)\n", bad);
+        let text <string> = concat(bad, "' (use contract|gcc|actions|sarif)");
+        eprintln_str(text);
+        free_str(text);
         free_str(bad);
         free_match(m);
         return 2;
@@ -783,7 +881,7 @@ fun main() <int> {
 
     let finc_bin <string> = m.get("finc");
     if (m.pos_count <= 0) {
-        cli_dprintf(2, "linf: no paths given\n");
+        eprintln_str("linf: no paths given");
         free_match(m);
         return 2;
     }
@@ -883,8 +981,16 @@ fun main() <int> {
     if (run.linf_exit > 0) { status = "failed"; }
     if (format_mode != 3) {
         let total_warns <int> = run.finc_warnings + (run.linf_count - run.linf_errors);
-        cli_dprintf(2, "{\"kind\":\"summary\",\"errors\":%d,\"warnings\":%d,\"exitCode\":%d,\"status\":\"%s\"}\n",
-              run.finc_errors + run.linf_errors, total_warns, run.linf_exit, status);
+        let errors <string> = itoa(run.finc_errors + run.linf_errors);
+        let warnings <string> = itoa(total_warns);
+        let exit_code <string> = itoa(run.linf_exit);
+        let record <string> = concat("{\"kind\":\"summary\",\"errors\":", errors);
+        let with_warnings <string> = concat(record, concat(",\"warnings\":", warnings));
+        let with_exit <string> = concat(with_warnings, concat(",\"exitCode\":", exit_code));
+        let full <string> = concat(with_exit, concat(",\"status\":\"", concat(status, "\"}")));
+        eprintln_str(full);
+        free_str(full); free_str(with_exit); free_str(with_warnings); free_str(record);
+        free_str(errors); free_str(warnings); free_str(exit_code);
     }
 
     // Ownership: every entry's strings were cloned at add time.

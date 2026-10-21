@@ -28,13 +28,14 @@ binary is real and shipped in this repo, written **in Fin** against the
 - **Rules status**: line-length / unused-import / delete-without-new /
   unchecked-index shipped (four of five); `fmt-drift` blocked until
   `finfmt --check`'s exit code is drift-truthful (RFC §4 records the probe).
-- **Production behavior**: compiler/source paths are literal POSIX shell
-  arguments; every invocation must provide exactly one valid trailing summary.
+- **Production behavior**: compiler/source paths are passed to the compiler as
+  literal arguments, quoted for the shell that runs it; every invocation must
+  provide exactly one valid trailing summary.
   Unknown record kinds survive verbatim in `contract`. Diagnostics grow beyond
   256; 65,536 stored findings trigger an explicit incomplete-results plumbing
   error (exit 2), not silent truncation. Imports track aliases and declaration
   boundaries without the former 32-name cap.
-- **Limits**: Linux CLI/process support follows the SDK. Fin allocations have no
+- **Limits**: CLI/process support follows the SDK. Fin allocations have no
   recoverable out-of-memory path; the explicit diagnostic ceiling is not an OOM
   guarantee. JSON nesting beyond 128 levels and decoded NUL strings fail as
   plumbing; command-line arguments cannot contain NUL. Import use remains a
