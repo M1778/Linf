@@ -17,9 +17,12 @@ binary is real and shipped in this repo, written **in Fin** against the
   (0 clean · 1 findings · 2 usage/plumbing · 3 finc failure propagated), and
   `tests/run.py` pins the original self-check behaviors plus 61 production
   regression checks at either `--opt=-O0` (default) or `--opt=-O2`.
-  `tests/run.sh` remains a POSIX convenience wrapper. Linux x86_64 and native
-  Windows x86_64 O0/O2 self-checks and contract regressions pass; macOS has
-  frontend/codegen coverage but still needs native execution.
+  `tests/run.sh` remains a POSIX convenience wrapper. O0/O2 self-checks and
+  contract regressions pass on all six native hosts—Linux, macOS and Windows,
+  each on x86_64 and ARM64—in [native matrix 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084).
+  POSIX runs 61 regressions; Windows runs 60 with the POSIX signal case skipped.
+  The compiler is externally verified candidate `5360b051b8e82a4f10052c3dbb77bc66cc727cd7`
+  from CI run `40028977601`, not a released compiler.
   `finn` packaging
   (RFC §5 stage 4) is still pending.
 - **Try it**:
