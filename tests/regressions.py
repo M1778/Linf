@@ -2,6 +2,9 @@
 """Executable contract/import regressions, using a controlled compiler subprocess."""
 import json
 import os
+import shlex
+import shutil
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -36,33 +39,27 @@ def records(*rows):
 
 with tempfile.TemporaryDirectory(prefix=".linf-regressions-", dir=Path(__file__).parent) as directory:
     root = Path(directory)
-    fake = root / "compiler space ' quote $(touch compiler-pwn) `touch backtick-pwn`"
-    fake.write_text('''#!/usr/bin/env python3
-import json, os
-from pathlib import Path
-import sys
-assert sys.argv[2:] == ["--diagnostics=json", "--color=never"], sys.argv
-if os.environ.get("LINF_ARGV_LOG"):
-    Path(os.environ["LINF_ARGV_LOG"]).write_text(json.dumps(sys.argv[1:]))
-p = Path(sys.argv[1])
-sys.stderr.write(Path(str(p) + ".jsonl").read_text())
-rc = Path(str(p) + ".rc")
-sys.exit(int(rc.read_text()) if rc.exists() else 0)
-''')
-    fake.chmod(0o755)
+    suffix = ".exe" if os.name == "nt" else ""
+    fake = root / ("compiler space ' quote $(touch compiler-pwn) `touch backtick-pwn`" + suffix)
+    compiler_command = os.environ.get("CC", "clang" if os.name == "nt" else "cc")
+    driver = [compiler_command] if Path(compiler_command).is_file() else shlex.split(compiler_command)
+    built = subprocess.run([*driver, str(Path(__file__).with_name("fake_compiler.c")),
+                            "-o", str(fake)], text=True, capture_output=True, timeout=90)
+    assert built.returncode == 0, (built.stdout, built.stderr)
     source = root / "clean.fin"
     source.write_text("fun main() <noret> {}\n")
 
     def prepare(text, target=source, rc=0):
-        Path(str(target) + ".jsonl").write_text(text)
+        Path(str(target) + ".jsonl").write_bytes(text.encode('utf-8'))
         Path(str(target) + ".rc").write_text(str(rc))
 
-    def run(lane="contract", targets=None, compiler=fake):
+    def run(lane="contract", targets=None, compiler=fake, extra=None):
         env = os.environ.copy()
         env["LINF_ARGV_LOG"] = str(root / "argv.json")
+        env.update(extra or {})
         result = subprocess.run([BIN, "check", "--finc", str(compiler), "--format", lane,
                                  *(str(p) for p in (targets or [source]))],
-                                cwd=root, env=env, capture_output=True, text=True, timeout=45)
+                                cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", timeout=45)
         assert result.stdout == "", (lane, result.stdout)
         return result
 
@@ -142,6 +139,26 @@ sys.exit(int(rc.read_text()) if rc.exists() else 0)
     check(run().returncode == 3, "valid summary is authoritative")
     prepare("", rc=3)
     check(run().returncode == 3, "compiler failure fallback")
+    prepare(records(summary()), rc=3)
+    check(run().returncode == 0, "native failure cannot override a valid summary")
+    prepare(records(summary()))
+    check(run(extra={"LINF_FAKE_STDOUT": "1"}).returncode == 0, "stdout and stderr share the capture pipe")
+    check(run(compiler=root / "missing-compiler").returncode == 2, "missing executable is plumbing")
+    path_directory = root / "compiler-path"
+    path_directory.mkdir()
+    sibling = path_directory / ("bare-compiler" + suffix)
+    shutil.copy2(fake, sibling)
+    check(run(compiler=sibling.name, extra={"PATH": str(path_directory) + os.pathsep + os.environ.get("PATH", "")}).returncode == 0,
+          "bare compiler resolved through PATH outside cwd")
+    prepare(records(summary()).replace("\n", "\x00\n"))
+    check(run().returncode == 2, "raw NUL is not silently truncated")
+    if os.name == "posix":
+        crash = root / "crash-compiler"
+        crash.write_text('#!/usr/bin/env python3\nimport os, signal\nos.kill(os.getpid(), signal.SIGTERM)\n')
+        crash.chmod(0o755)
+        check(run(compiler=crash).returncode == 3, "signal-terminated compiler failure")
+    else:
+        print("SKIP regression POSIX signal-terminated compiler")
 
     second = root / "second.fin"
     second.write_text(source.read_text())
@@ -155,7 +172,9 @@ sys.exit(int(rc.read_text()) if rc.exists() else 0)
     prepare("", source)
     check(run(targets=[source, second]).returncode == 3, "compiler failure outranks plumbing")
 
-    special = root / 'source space \' " $(touch source-pwn) `touch source-backtick-pwn`.fin'
+    special_name = 'source space \' $(touch source-pwn) `touch source-backtick-pwn`.fin'
+    if os.name != "nt": special_name = special_name.replace("space ", 'space " ')
+    special = root / special_name
     special.write_text(source.read_text())
     prepare(records(summary()), special)
     result = run(targets=[special])

@@ -15,8 +15,12 @@ binary is real and shipped in this repo, written **in Fin** against the
   four output lanes (`contract`/`gcc`/`actions`/`sarif`), all on stderr; the
   three scanner rules + line length live, the exit-code mirror holds
   (0 clean · 1 findings · 2 usage/plumbing · 3 finc failure propagated), and
-  `tests/run.sh` pins the 28 original self-check behaviors plus 55 production
-  regression checks at either `OPT=-O0` (default) or `OPT=-O2`. `finn` packaging
+  `tests/run.py` pins the original self-check behaviors plus 61 production
+  regression checks at either `--opt=-O0` (default) or `--opt=-O2`.
+  `tests/run.sh` remains a POSIX convenience wrapper. Linux x86_64 and native
+  Windows x86_64 O0/O2 self-checks and contract regressions pass; macOS has
+  frontend/codegen coverage but still needs native execution.
+  `finn` packaging
   (RFC §5 stage 4) is still pending.
 - **Try it**:
   ```sh
@@ -29,18 +33,20 @@ binary is real and shipped in this repo, written **in Fin** against the
   unchecked-index shipped (four of five); `fmt-drift` blocked until
   `finfmt --check`'s exit code is drift-truthful (RFC §4 records the probe).
 - **Production behavior**: compiler/source paths are passed to the compiler as
-  literal arguments, quoted for the shell that runs it; every invocation must
-  provide exactly one valid trailing summary.
+  literal arguments through native process APIs, without a shell; every invocation must
+  provide exactly one valid trailing summary. Capture retains raw bytes,
+  rejects raw NUL and reports output exceeding 128 MiB as incomplete.
   Unknown record kinds survive verbatim in `contract`. Diagnostics grow beyond
   256; 65,536 stored findings trigger an explicit incomplete-results plumbing
   error (exit 2), not silent truncation. Imports track aliases and declaration
   boundaries without the former 32-name cap.
-- **Limits**: CLI/process support follows the SDK. Fin allocations have no
+- **Limits**: argument intake uses the compiler's `main(args)` surface, with
+  4,096 arguments / 1 MiB of argument bytes; `--` permits option-looking paths.
+  The scanner remains the byte-exact SDK scanner. Fin allocations have no
   recoverable out-of-memory path; the explicit diagnostic ceiling is not an OOM
   guarantee. JSON nesting beyond 128 levels and decoded NUL strings fail as
   plumbing; command-line arguments cannot contain NUL. Import use remains a
-  token-spelling heuristic, not scope/ownership analysis. Frozen SDK scanner and
-  CLI allocation/argument limits remain outside this repository.
+  token-spelling heuristic, not scope/ownership analysis.
 - **Contract** — plumbing pinned to the finc machine contract v3
   (`kFincContractVersion`); `VERSION` major tracks it, same policy as
   `fin-sdk` (currently 3.0.0).
