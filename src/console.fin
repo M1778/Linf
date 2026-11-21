@@ -1,0 +1,41 @@
+import { to_chars, len } from strings::std;
+
+namespace linf {
+#c_ifdef FIN_TARGET_WINDOWS
+#[llvm_name="_write"] @define console_write(fd: int, bytes: &char, count: uint) <int>;
+#[llvm_name="_errno"] @define console_errno() <&int>;
+#[llvm_name="_setmode"] @define console_mode(fd: int, mode: int) <int>;
+#c_else
+#[llvm_name="write"] @define console_write(fd: int, bytes: &char, count: ulong) <long>;
+#c_ifdef FIN_TARGET_DARWIN
+#[llvm_name="__error"]
+#c_else
+#[llvm_name="__errno_location"]
+#c_endif
+@define console_errno() <&int>;
+#c_endif
+
+pub fun linf_console_init() <noret> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    blame console_mode(2, 32768) >= 0, "cannot set binary stderr";
+    #c_endif
+}
+
+pub fun linf_eprint(text: string) <noret> {
+    let bytes <[char]> = to_chars(text);
+    let count <int> = len(text);
+    let done <int> = 0;
+    while (done < count) {
+        #c_ifdef FIN_TARGET_WINDOWS
+        let written <long> = cast<long>(console_write(2, &bytes[done], cast<uint>(count - done)));
+        #c_else
+        let written <long> = console_write(2, &bytes[done], cast<ulong>(count - done));
+        #c_endif
+        if (written < cast<long>(0) && *console_errno() == 4) { continue; }
+        if (written <= cast<long>(0)) { break; }
+        done += cast<int>(written);
+    }
+    delete bytes;
+}
+pub fun linf_eprintln(text: string) <noret> { linf_eprint(text); linf_eprint("\n"); }
+}

@@ -1,0 +1,328 @@
+import { len, to_chars, from_chars, concat, clone, free_str } from strings::std;
+import { Buffer, new_buffer, free_buffer } from buffer::std;
+
+namespace linf {
+
+pub struct CompilerCapture {
+    started <bool> = false,
+    complete <bool> = true,
+    exit_code <int> = -1,
+    signaled <bool> = false,
+    bytes <[char]>,
+    size <int> = 0,
+}
+
+pub fun free_capture(result: CompilerCapture) <noret> { delete result.bytes; }
+
+priv fun append_capture(result: &CompilerCapture, chunk: [char], count: int) <noret> {
+    // Drain excess output so a child blocked on its pipe cannot deadlock the parent.
+    if (!result.complete) { return; }
+    if (count > 134217728 - result.size) { result.complete = false; return; }
+    let needed <int> = result.size + count;
+    if (needed > result.bytes.length) {
+        let capacity <int> = result.bytes.length;
+        while (capacity < needed) { capacity *= 2; }
+        let grown <[char]> = new [char, capacity]{};
+        for (let i <int> = 0; i < result.size; i++) { grown[i] = result.bytes[i]; }
+        delete result.bytes;
+        result.bytes = grown;
+    }
+    for (let i <int> = 0; i < count; i++) { result.bytes[result.size + i] = chunk[i]; }
+    result.size = needed;
+}
+
+#c_ifdef FIN_TARGET_WINDOWS
+
+struct SecurityAttributes { size <uint>, descriptor <&void>, inherit <int> };
+struct StartupInfo {
+    size <uint>, reserved <&void>, desktop <&void>, title <&void>,
+    x <uint>, y <uint>, width <uint>, height <uint>,
+    chars_x <uint>, chars_y <uint>, fill <uint>, flags <uint>,
+    show <ushort>, reserved_size <ushort>, reserved_bytes <&void>,
+    input <&void>, output <&void>, error <&void>,
+};
+struct StartupInfoEx { startup <StartupInfo>, attributes <&void> };
+struct ProcessInformation { process <&void>, thread <&void>, pid <uint>, tid <uint> };
+
+#[llvm_name="CreatePipe"]
+@define capture_pipe(read_handle: &&void, write_handle: &&void, security: &void, size: uint) <int>;
+#[llvm_name="SetHandleInformation"]
+@define capture_handle_flags(handle: &void, mask: uint, flags: uint) <int>;
+#[llvm_name="CloseHandle"]
+@define capture_close(handle: &void) <int>;
+#[llvm_name="GetLastError"]
+@define capture_error() <uint>;
+#[llvm_name="ReadFile"]
+@define capture_read(handle: &void, bytes: &char, count: uint, read: &uint, overlapped: &void) <int>;
+#[llvm_name="WaitForSingleObject"]
+@define capture_wait(handle: &void, timeout: uint) <uint>;
+#[llvm_name="GetExitCodeProcess"]
+@define capture_exit_code(handle: &void, code: &uint) <int>;
+#[llvm_name="MultiByteToWideChar"]
+@define capture_wide(codepage: uint, flags: uint, text: string, bytes: int, output: &ushort, size: int) <int>;
+#[llvm_name="CreateFileW"]
+@define capture_open(path: &ushort, access: uint, share: uint, security: &void, disposition: uint, flags: uint, template: &void) <&void>;
+#[llvm_name="CreateProcessW"]
+@define capture_spawn(app: &ushort, command: &ushort, process_security: &void, thread_security: &void, inherit: int, flags: uint, environment: &void, directory: &ushort, startup: &void, process: &void) <int>;
+#[llvm_name="InitializeProcThreadAttributeList"]
+@define capture_attributes(list: &void, count: uint, flags: uint, size: &ulong) <int>;
+#[llvm_name="UpdateProcThreadAttribute"]
+@define capture_attribute(list: &void, flags: uint, attribute: ulong, value: &void, size: ulong, old_value: &void, returned: &ulong) <int>;
+#[llvm_name="DeleteProcThreadAttributeList"]
+@define capture_free_attributes(list: &void) <noret>;
+#[llvm_name="calloc"]
+@define capture_alloc(count: ulong, size: ulong) <&void>;
+#[llvm_name="free"]
+@define capture_free(memory: &void) <noret>;
+
+// Windows argv parsing doubles backslashes before a quote or the closing quote.
+pub fun windows_argument(text: string) <string> {
+    let out <Buffer> = new_buffer(64);
+    let chars <[char]> = to_chars(text);
+    out.write_char('"');
+    let slashes <int> = 0;
+    for (let i <int> = 0; i < chars.length - 1; i++) {
+        let c <char> = chars[i];
+        if (c == '\\') { slashes++; continue; }
+        let repeat <int> = slashes;
+        if (c == '"') { repeat = slashes * 2 + 1; }
+        for (let j <int> = 0; j < repeat; j++) { out.write_char('\\'); }
+        slashes = 0;
+        out.write_char(c);
+    }
+    for (let j <int> = 0; j < slashes * 2; j++) { out.write_char('\\'); }
+    out.write_char('"');
+    delete chars;
+    let result <string> = out.to_string();
+    free_buffer(out);
+    return result;
+}
+
+pub fun capture_compiler(executable: string, source: string) <CompilerCapture> {
+    let result <CompilerCapture> = CompilerCapture{bytes: new [char, 8192]{}};
+    let security <SecurityAttributes> = SecurityAttributes{size: 24, descriptor: null, inherit: 1};
+    let reader <&void> = null;
+    let writer <&void> = null;
+    if (capture_pipe(&reader, &writer, &security, cast<uint>(0)) == 0) { return result; }
+    if (capture_handle_flags(reader, cast<uint>(1), cast<uint>(0)) == 0) {
+        capture_close(reader); capture_close(writer); return result;
+    }
+    let nul <[ushort]> = new [ushort, 4]{};
+    nul[0] = cast<ushort>(78); nul[1] = cast<ushort>(85); nul[2] = cast<ushort>(76);
+    let input <&void> = capture_open(&nul[0], cast<uint>(2147483648), cast<uint>(3), &security, cast<uint>(3), cast<uint>(128), null);
+    delete nul;
+    let handle_bits <long> = 0;
+    #[llvm_name="memcpy"] @define capture_copy(dst: &void, src: &void, size: ulong) <&void>;
+    capture_copy(&handle_bits, &input, cast<ulong>(8));
+    if (handle_bits == cast<long>(-1)) { capture_close(reader); capture_close(writer); return result; }
+
+    let attribute_size <ulong> = cast<ulong>(0);
+    capture_attributes(null, cast<uint>(1), cast<uint>(0), &attribute_size);
+    let attributes <&void> = capture_alloc(cast<ulong>(1), attribute_size);
+    if (attributes == null) { capture_close(input); capture_close(reader); capture_close(writer); return result; }
+    if (capture_attributes(attributes, cast<uint>(1), cast<uint>(0), &attribute_size) == 0) {
+        capture_free(attributes); capture_close(input); capture_close(reader); capture_close(writer); return result;
+    }
+    let handles <[&void]> = new [&void, 2]{};
+    handles[0] = input; handles[1] = writer;
+    let restricted <int> = capture_attribute(attributes, cast<uint>(0), cast<ulong>(131074), &handles[0], cast<ulong>(16), null, null);
+    if (restricted == 0) {
+        delete handles;
+        capture_free_attributes(attributes); capture_free(attributes);
+        capture_close(input); capture_close(reader); capture_close(writer); return result;
+    }
+    let command <Buffer> = new_buffer(256);
+    let quoted_executable <string> = windows_argument(executable);
+    let quoted_source <string> = windows_argument(source);
+    command.write_string(quoted_executable); command.write_char(' '); command.write_string(quoted_source);
+    command.write_string(" --diagnostics=json --color=never");
+    free_str(quoted_executable); free_str(quoted_source);
+    let text <string> = command.to_string();
+    free_buffer(command);
+    // Match the CRT argv's native code page; process creation itself uses UTF-16.
+    let wide_size <int> = capture_wide(cast<uint>(0), cast<uint>(0), text, -1, null, 0);
+    let wide <[ushort]> = new [ushort, wide_size + 1]{};
+    let converted <int> = 0;
+    if (wide_size > 0) { converted = capture_wide(cast<uint>(0), cast<uint>(0), text, -1, &wide[0], wide_size); }
+    free_str(text);
+    let startup <StartupInfoEx> = StartupInfoEx{
+        startup: StartupInfo{size: 112, reserved: null, desktop: null, title: null,
+            x: 0, y: 0, width: 0, height: 0, chars_x: 0, chars_y: 0, fill: 0,
+            flags: 256, show: 0, reserved_size: 0, reserved_bytes: null,
+            input: input, output: writer, error: writer}, attributes: attributes};
+    let process <ProcessInformation> = ProcessInformation{process: null, thread: null, pid: 0, tid: 0};
+    let started <int> = 0;
+    if (converted > 0) { started = capture_spawn(null, &wide[0], null, null, 1, cast<uint>(134742016), null, null, &startup, &process); }
+    delete wide;
+    capture_free_attributes(attributes); capture_free(attributes); delete handles;
+    capture_close(input); capture_close(writer);
+    if (started == 0) { capture_close(reader); return result; }
+    result.started = true;
+    capture_close(process.thread);
+    let chunk <[char]> = new [char, 8192]{};
+    while (true) {
+        let got <uint> = cast<uint>(0);
+        let read_ok <int> = capture_read(reader, &chunk[0], cast<uint>(8192), &got, null);
+        if (read_ok == 0) {
+            if (capture_error() != cast<uint>(109)) { result.complete = false; }
+            break;
+        }
+        if (got == cast<uint>(0)) { break; }
+        append_capture(&result, chunk, cast<int>(got));
+    }
+    delete chunk;
+    capture_close(reader);
+    let code <uint> = cast<uint>(0);
+    if (capture_wait(process.process, cast<uint>(-1)) != cast<uint>(0) || capture_exit_code(process.process, &code) == 0) {
+        result.complete = false;
+    } else {
+        result.exit_code = cast<int>(code);
+        result.signaled = code >= cast<uint>(1073741824);
+    }
+    capture_close(process.process);
+    return result;
+}
+
+#c_else
+
+#[llvm_name="pipe"] @define capture_pipe(fds: &int) <int>;
+#[llvm_name="fcntl"] @define capture_fcntl(fd: int, command: int, ...) <int>;
+#[llvm_name="close"] @define capture_close(fd: int) <int>;
+#[llvm_name="read"] @define capture_read(fd: int, bytes: &char, count: ulong) <long>;
+#[llvm_name="write"] @define capture_write(fd: int, bytes: &int, count: ulong) <long>;
+#[llvm_name="dup2"] @define capture_dup(oldfd: int, newfd: int) <int>;
+#[llvm_name="fork"] @define capture_fork() <int>;
+#[llvm_name="execv"] @define capture_exec(file: string, argv: &string) <int>;
+#[llvm_name="getenv"] @define capture_getenv(name: string) <string>;
+#[llvm_name="waitpid"] @define capture_wait(pid: int, status: &int, options: int) <int>;
+#[llvm_name="_exit"] @define capture_exit(code: int) <noret>;
+#c_ifdef FIN_TARGET_DARWIN
+#[llvm_name="__error"]
+#c_else
+#[llvm_name="__errno_location"]
+#c_endif
+@define capture_errno() <&int>;
+
+struct PipePair { read_fd <int> = -1, write_fd <int> = -1, ok <bool> = false };
+
+priv fun close_pair(fds: PipePair) <noret> {
+    if (fds.read_fd >= 0) { capture_close(fds.read_fd); }
+    if (fds.write_fd >= 0) { capture_close(fds.write_fd); }
+}
+
+priv fun make_pipe() <PipePair> {
+    let fds <PipePair> = PipePair{};
+    let raw <[int]> = new [int, 2]{};
+    if (capture_pipe(&raw[0]) != 0) { delete raw; return fds; }
+    // dup2 must not replace a pipe endpoint when the caller closed fd 0, 1 or 2.
+    fds.read_fd = capture_fcntl(raw[0], 0, 3);
+    fds.write_fd = capture_fcntl(raw[1], 0, 3);
+    capture_close(raw[0]); capture_close(raw[1]); delete raw;
+    if (fds.read_fd < 0 || fds.write_fd < 0) { close_pair(fds); return PipePair{}; }
+    if (capture_fcntl(fds.read_fd, 2, 1) != 0 || capture_fcntl(fds.write_fd, 2, 1) != 0) { close_pair(fds); return PipePair{}; }
+    fds.ok = true;
+    return fds;
+}
+
+priv fun executable_paths(executable: string) <[string]> {
+    let chars <[char]> = to_chars(executable);
+    let direct <bool> = false;
+    for (let i <int> = 0; i < chars.length - 1; i++) { if (chars[i] == '/') { direct = true; } }
+    delete chars;
+    if (direct) {
+        let result <[string]> = new [string, 1]{};
+        result[0] = clone(executable);
+        return result;
+    }
+    let path <string> = capture_getenv("PATH");
+    if (path == null) { path = "/bin:/usr/bin"; }
+    let bytes <[char]> = to_chars(path);
+    let count <int> = 1;
+    for (let i <int> = 0; i < bytes.length - 1; i++) { if (bytes[i] == ':') { count++; } }
+    let result <[string]> = new [string, count]{};
+    let start <int> = 0;
+    let index <int> = 0;
+    for (let i <int> = 0; i < bytes.length; i++) {
+        if (bytes[i] == ':' || bytes[i] == cast<char>(0)) {
+            if (i == start) { result[index] = clone(executable); }
+            else {
+                let directory <string> = from_chars(bytes, start, i - start);
+                let base <string> = concat(directory, "/");
+                result[index] = concat(base, executable);
+                free_str(directory); free_str(base);
+            }
+            index++; start = i + 1;
+        }
+    }
+    delete bytes;
+    return result;
+}
+
+pub fun capture_compiler(executable: string, source: string) <CompilerCapture> {
+    let result <CompilerCapture> = CompilerCapture{bytes: new [char, 8192]{}};
+    let output <PipePair> = make_pipe();
+    if (!output.ok) { return result; }
+    let errors <PipePair> = make_pipe();
+    if (!errors.ok) { close_pair(output); return result; }
+    let argv <[string]> = new [string, 5]{};
+    argv[0] = executable; argv[1] = source;
+    argv[2] = "--diagnostics=json"; argv[3] = "--color=never";
+    let candidates <[string]> = executable_paths(executable);
+    let pid <int> = capture_fork();
+    if (pid == 0) {
+        capture_close(output.read_fd); capture_close(errors.read_fd);
+        let ok <bool> = capture_dup(output.write_fd, 1) >= 0 && capture_dup(output.write_fd, 2) >= 0;
+        capture_close(output.write_fd);
+        if (ok) {
+            for (let i <int> = 0; i < candidates.length; i++) {
+                capture_exec(candidates[i], &argv[0]);
+                let code <int> = *capture_errno();
+                if (code != 2 && code != 13 && code != 20) { break; }
+            }
+        }
+        let error <int> = *capture_errno();
+        capture_write(errors.write_fd, &error, cast<ulong>(4));
+        capture_exit(127);
+    }
+    for (let i <int> = 0; i < candidates.length; i++) { free_str(candidates[i]); }
+    delete candidates; delete argv;
+    capture_close(output.write_fd); capture_close(errors.write_fd);
+    if (pid < 0) { capture_close(output.read_fd); capture_close(errors.read_fd); return result; }
+    result.started = true;
+    let chunk <[char]> = new [char, 8192]{};
+    while (true) {
+        let got <long> = capture_read(output.read_fd, &chunk[0], cast<ulong>(8192));
+        if (got == cast<long>(0)) { break; }
+        if (got < cast<long>(0)) {
+            if (*capture_errno() == 4) { continue; }
+            result.complete = false; break;
+        }
+        append_capture(&result, chunk, cast<int>(got));
+    }
+    capture_close(output.read_fd);
+    let exec_error <long> = cast<long>(0);
+    while (true) {
+        exec_error = capture_read(errors.read_fd, &chunk[0], cast<ulong>(4));
+        if (exec_error < cast<long>(0) && *capture_errno() == 4) { continue; }
+        break;
+    }
+    if (exec_error > cast<long>(0)) { result.started = false; }
+    if (exec_error < cast<long>(0)) { result.complete = false; }
+    capture_close(errors.read_fd); delete chunk;
+    let status <int> = 0;
+    let waited <int> = -1;
+    while (true) {
+        waited = capture_wait(pid, &status, 0);
+        if (waited < 0 && *capture_errno() == 4) { continue; }
+        break;
+    }
+    if (waited != pid) { result.complete = false; }
+    else {
+        result.signaled = (status & 127) != 0;
+        result.exit_code = (status / 256) & 255;
+    }
+    return result;
+}
+
+#c_endif
+}

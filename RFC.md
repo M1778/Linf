@@ -26,14 +26,15 @@ forks a second lexer.** Linf builds on the machine contract the way `finn` build
    Linf plumbing failure (`exit 2`), because the contract says the summary is
    the only way to tell "finished cleanly" from "died".
    Two capture rulings the v0 binary pins:
-   - the capture merges `2>&1` into the read pipe (process.fin's
-     `exec_command` captures stdout), sound only because finc's stdout is
-     contract-silent for every non-reserved flag — which is exactly what
-     this invocation uses;
+   - stdout and stderr share a native pipe. POSIX uses fork/exec with an
+     argument array; Windows uses CreateProcessW with escaped arguments and
+     a restricted inherited-handle list. No shell interprets the paths;
    - finc's **own summary line is the authoritative exit source** (its
-     `exitCode` field), because the popen waitstatus is raw pclose
-     (256×rc); the waitstatus decodes only as a fallback when no summary
-     arrived (low byte nonzero = signal kill = `3`; shell 127 = `2`).
+     `exitCode` field). Native exit status is a fallback only when no valid
+     summary arrives. A missing executable is plumbing (`2`), while a
+     signal-terminated compiler or compiler exit `3` propagates failure (`3`).
+     Capture is bounded at 128 MiB; excess output is drained and reported as
+     incomplete, never silently shortened.
 3. Linf appends **its own findings as `diagnostic` objects in the same shape**
    (`severity: "warning"` v0, `code: "linf:<rule>"` — `code` is contract-open
    to new values, `help` may carry a fix-suggestion), then emits **one

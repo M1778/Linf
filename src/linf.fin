@@ -5,10 +5,9 @@
 //
 //     finc <path> --diagnostics=json --color=never
 //
-// and parses the contract's JSONL off stderr. The capture merges `2>&1` into
-// the read pipe (process.fin's exec_command captures stdout): sound only
-// because finc's stdout is contract-silent for every non-reserved flag, which
-// is exactly what this invocation uses.
+// and parses the contract's JSONL from a native pipe shared by stdout and
+// stderr. No shell interprets executable or source paths. finc's stdout is
+// contract-silent for this invocation.
 //
 // Output (RFC §3): the contract shape by default; `--format gcc` one-liners
 // (VS Code `problemMatcher: "$gcc"`, Neovim errorformat); `--format actions`
@@ -25,8 +24,9 @@
 // diagnostic outside the pool. Import tracking is bounded by the token count.
 
 import { read_to_string, free_file_content } from fs::std;
-import { ProcessResult, exec_command, free_process_result } from process::std;
-import { Command, Match, Outcome, free_match } from cli::std;
+import { CompilerCapture, capture_compiler, free_capture } from "capture.fin";
+import { CliArgs, parse_cli, free_cli } from "cli_args.fin";
+import { Outcome } from outcome::std;
 import { CdkTokens, cdk_scan, free_cdk_tokens } from cdk::std;
 import { tok_ident, tok_semicolon, tok_lbracket, tok_rbracket, tok_rparen,
       tok_lbrace, tok_rbrace, tok_comma, tok_dot, tok_double_colon, kw_as,
@@ -35,7 +35,7 @@ import { tok_ident, tok_semicolon, tok_lbracket, tok_rbracket, tok_rparen,
 import { Buffer, new_buffer, free_buffer } from buffer::std;
 import { len, to_chars, from_chars, equals, concat, clone, free_str } from strings::std;
 import { json_decode_str } from json::std;
-import { eprint_str, eprintln_str } from stdio::std;
+import { linf_eprint, linf_eprintln, linf_console_init } from "console.fin";
 
 // A finding in the contract's field set, renderer-agnostic: linf-owned
 // findings carry `code` ("linf:<rule>"); finc-sourced ones do not, because
@@ -419,7 +419,7 @@ priv fun chew_bytes(run: &Run, b: [char], end: int, contract_mode: int, path: st
         if (!rec.valid) { broken = true; }
         else if (contract_mode != 0 && !equals(kind, "summary")) {
             let raw <string> = from_chars(b, start, e - start);
-            eprintln_str(raw);
+            linf_eprintln(raw);
             free_str(raw);
         }
         free_str(kind);
@@ -439,23 +439,6 @@ priv fun chew_bytes(run: &Run, b: [char], end: int, contract_mode: int, path: st
     run.finc_errors += errors;
     run.finc_warnings += warnings;
     return complete;
-}
-
-// POSIX shell words, not shell fragments. argv and Fin strings are already
-// NUL-terminated: embedded NUL cannot be supplied as a command-line argument.
-priv fun shell_word(text: string) <string> {
-    let out <Buffer> = new_buffer(32);
-    let chars <[char]> = to_chars(text);
-    out.write_char('\'');
-    for (let i <int> = 0; i < len(text); i++) {
-        if (chars[i] == '\'') { out.write_string("'\\''"); }
-        else { out.write_char(chars[i]); }
-    }
-    out.write_char('\'');
-    delete chars;
-    let result <string> = out.to_string();
-    free_buffer(out);
-    return result;
 }
 
 // ---- the three token rules, proven in fin-sdk's linf_first_rules.fin -------
@@ -691,7 +674,7 @@ priv fun write_contract_line(f: &Fnd) <noret> {
     let with_end <string> = concat(with_col, concat(",\"endLine\":", itoa(f.line)));
     let with_endcol <string> = concat(with_end, concat(",\"endColumn\":", itoa(f.col)));
     let full <string> = concat(with_endcol, ",\"help\":null,\"attribution\":null}");
-    eprintln_str(full);
+    linf_eprintln(full);
     free_str(full);
     free_str(with_endcol);
     free_str(with_end);
@@ -716,7 +699,7 @@ priv fun write_gcc_line(f: &Fnd) <noret> {
         let sev <string> = sev_word(f.sev);
         let line <string> = concat(tool, concat(": ", sev));
         let full <string> = concat(line, concat(": ", f.message));
-        eprintln_str(full);
+        linf_eprintln(full);
         // sev_word returns a literal: borrowed, not freed.
         free_str(full); free_str(line);
     } else {
@@ -725,7 +708,7 @@ priv fun write_gcc_line(f: &Fnd) <noret> {
         let with_col <string> = concat(head, concat(":", itoa(f.col)));
         let with_sev <string> = concat(with_col, concat(": ", sev));
         let full <string> = concat(with_sev, concat(": ", f.message));
-        eprintln_str(full);
+        linf_eprintln(full);
         // sev_word returns a literal: borrowed, not freed.
         free_str(full); free_str(with_sev); free_str(with_col); free_str(head);
     }
@@ -738,7 +721,7 @@ priv fun write_actions_line(f: &Fnd) <noret> {
     if (equals(f.file, "")) {
         let head <string> = concat("::", aword);
         let full <string> = concat(head, concat(" ::", f.message));
-        eprintln_str(full);
+        linf_eprintln(full);
         free_str(full); free_str(head);
     } else {
         let head <string> = concat("::", aword);
@@ -746,7 +729,7 @@ priv fun write_actions_line(f: &Fnd) <noret> {
         let with_line <string> = concat(with_file, concat(",line=", itoa(f.line)));
         let with_col <string> = concat(with_line, concat(",col=", itoa(f.col)));
         let full <string> = concat(with_col, concat("::", f.message));
-        eprintln_str(full);
+        linf_eprintln(full);
         free_str(full); free_str(with_col); free_str(with_line); free_str(with_file); free_str(head);
     }
 }
@@ -754,14 +737,14 @@ priv fun write_actions_line(f: &Fnd) <noret> {
 priv fun write_sarif(run: &Run, version: string) <noret> {
     let head <string> = concat("{\"version\":\"2.1.0\",\"$schema\":\"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"linf\",\"version\":\"", version);
     let head2 <string> = concat(head, "\",\"informationUri\":\"https://github.com/M1778/Linf\",\"rules\":[{\"id\":\"linf:line-length\"},{\"id\":\"linf:unused-import\"},{\"id\":\"linf:delete-without-new\"},{\"id\":\"linf:unchecked-index\"},{\"id\":\"linf:fmt-drift\"}]}},\"results\":[");
-    eprint_str(head2);
+    linf_eprint(head2);
     free_str(head2); free_str(head);
     let first <int> = 1;
     let idx <int> = 0;
     while (idx < run.size()) {
         let f <Fnd> = *run.at(idx);
         if (first == 0) {
-            eprint_str(",");
+            linf_eprint(",");
         }
         first = 0;
         let enc_msg <string> = json_encode_str(f.message);
@@ -773,7 +756,7 @@ priv fun write_sarif(run: &Run, version: string) <noret> {
             // The message object closes here; the locations key is a sibling
             // of it, not a child.
             let part3 <string> = concat(part2, "}");
-            eprint_str(part3);
+            linf_eprint(part3);
             // sev_word returns a literal: borrowed, not freed.
             free_str(part3); free_str(part2); free_str(part);
         } else {
@@ -783,7 +766,7 @@ priv fun write_sarif(run: &Run, version: string) <noret> {
             let part2 <string> = concat(part, concat(",\"level\":\"", sev));
             let part3 <string> = concat(part2, concat("\",\"message\":{\"text\":", enc_msg));
             let part4 <string> = concat(part3, "}");
-            eprint_str(part4);
+            linf_eprint(part4);
             // sev_word returns a literal: borrowed, not freed.
             free_str(part4); free_str(part3); free_str(part2); free_str(part);
             free_str(enc_code);
@@ -806,14 +789,14 @@ priv fun write_sarif(run: &Run, version: string) <noret> {
             // locations array element: three braces and a bracket.
             let part4 <string> = concat(region2, "}}}]");
             free_str(region2); free_str(region); free_str(open);
-            eprint_str(part4);
+            linf_eprint(part4);
             free_str(part4);
             free_str(enc_file);
         }
-        eprint_str("}");
+        linf_eprint("}");
         idx = idx + 1;
     }
-    eprintln_str("]}]}");
+    linf_eprintln("]}]}");
 }
 
 // Decimal digits for an int, as a fresh string the caller frees.
@@ -842,26 +825,17 @@ priv fun itoa(value: int) <string> {
 
 // ---- main --------------------------------------------------------------------
 
-fun main() <int> {
-    let cmd <Command> = Command::create("linf",
-          "linter for Fin - finc reports compiler errors, linf reports style warnings");
-    cmd.add_arg("format", 'f', true, "contract",
-          "contract|gcc|actions|sarif (output lane)");
-    cmd.add_arg("finc", '-', true, "finc", "the finc binary to run");
-    let check_sub <&Command> = Command::make_sub("check",
-          "check path(s): linf check [options] <path>...");
-    cmd.sub(check_sub);
-
-    let parsed <Outcome<Match>> = cmd.parse_args();
-    if (!parsed.is_ok()) {
-        // cli.fin reported and carried the problem; surface it verbatim.
-        // The Err's default value holds no arrays, so nothing frees here.
-        eprintln_str(parsed.message);
-        return 2;
+fun main(args: [string]) <int> {
+    linf_console_init();
+    let m <CliArgs> = parse_cli(args);
+    if (!m.ok) { free_cli(m); return 2; }
+    if (m.display == 1) {
+        printf("usage: linf check [--finc PATH] [--format contract|gcc|actions|sarif] <path>...\n");
+        free_cli(m); return 0;
     }
-    let m <Match> = parsed.value;
+    if (m.display == 2) { printf("linf\n"); free_cli(m); return 0; }
 
-    let fmt <string> = m.get("format");
+    let fmt <string> = m.format;
     let format_mode <int> = 0; // 0 contract 1 gcc 2 actions 3 sarif
     if (equals(fmt, "gcc")) {
         format_mode = 1;
@@ -872,63 +846,43 @@ fun main() <int> {
     } else if (!equals(fmt, "contract")) {
         let bad <string> = concat("linf: unknown --format '", fmt);
         let text <string> = concat(bad, "' (use contract|gcc|actions|sarif)");
-        eprintln_str(text);
+        linf_eprintln(text);
         free_str(text);
         free_str(bad);
-        free_match(m);
+        free_cli(m);
         return 2;
     }
 
-    let finc_bin <string> = m.get("finc");
-    if (m.pos_count <= 0) {
-        eprintln_str("linf: no paths given");
-        free_match(m);
+    let finc_bin <string> = m.compiler;
+    if (m.count <= 0) {
+        linf_eprintln("linf: no paths given");
+        free_cli(m);
         return 2;
     }
 
     let run <Run> = Run::create();
 
     let pi <int> = 0;
-    while (pi < m.pos_count) {
-        let path <string> = m.pos[pi];
+    while (pi < m.count) {
+        let path <string> = m.paths[pi];
 
-        // finc is the source of truth (RFC §1). The capture merges stderr
-        // into the read pipe: finc's stdout is contract-silent here.
-        let executable <string> = shell_word(finc_bin);
-        let source <string> = shell_word(path);
-        let base <string> = concat(executable, " ");
-        let one <string> = concat(base, source);
-        free_str(executable);
-        free_str(source);
-        free_str(base);
-        let two <string> = concat(one, " --diagnostics=json --color=never 2>&1");
-        free_str(one);
-        let res <ProcessResult> = exec_command(two);
-        free_str(two);
+        let res <CompilerCapture> = capture_compiler(finc_bin, path);
 
-        if (res.exit_code == -1) {
+        if (!res.started) {
             run.add(2, "linf:plumbing", "could not run the finc binary", path, 0, 0);
             run.worsen(2);
+        } else if (!res.complete) {
+            run.add(2, "linf:plumbing", "compiler capture failed or exceeded 128 MiB; findings are incomplete", path, 0, 0);
+            run.worsen(2);
+            if (res.signaled || res.exit_code == 3) { run.worsen(3); }
         } else {
-            let raw_text <string> = res.output;
-            let total <int> = len(raw_text);
-
             let contract <int> = 0;
             if (format_mode == 0) { contract = 1; }
-            let usable <[char]> = to_chars(raw_text);
-            let complete <bool> = chew_bytes(&run, usable, total, contract, path);
-            delete usable;
+            let complete <bool> = chew_bytes(&run, res.bytes, res.size, contract, path);
 
-            // A missing/broken summary is always plumbing, even when another
-            // invocation completed. Preserve compiler-failure precedence.
-            if (!complete) {
-                let st <int> = res.exit_code;
-                let high <int> = st / 256;
-                let rem <int> = st - high * 256;
-                if (rem != 0 || high == 3 || (high >= 128 && high <= 192)) {
-                    run.worsen(3);
-                }
-            }
+            // A valid compiler summary is authoritative; native status is only a fallback.
+            if (!complete && (res.signaled || res.exit_code == 3 ||
+                (res.exit_code >= 128 && res.exit_code <= 192))) { run.worsen(3); }
 
             // Rules require readable source. finc remains the only authority
             // on compilation; linter rules never manufacture compiler errors.
@@ -938,7 +892,7 @@ fun main() <int> {
                 free_file_content(src);
             }
         }
-        free_process_result(res);
+        free_capture(res);
 
         pi = pi + 1;
     }
@@ -988,7 +942,7 @@ fun main() <int> {
         let with_warnings <string> = concat(record, concat(",\"warnings\":", warnings));
         let with_exit <string> = concat(with_warnings, concat(",\"exitCode\":", exit_code));
         let full <string> = concat(with_exit, concat(",\"status\":\"", concat(status, "\"}")));
-        eprintln_str(full);
+        linf_eprintln(full);
         free_str(full); free_str(with_exit); free_str(with_warnings); free_str(record);
         free_str(errors); free_str(warnings); free_str(exit_code);
     }
@@ -1003,7 +957,7 @@ fun main() <int> {
         i = i + 1;
     }
     delete run.fnds;
-    free_match(m);
+    free_cli(m);
 
     return run.linf_exit;
 }

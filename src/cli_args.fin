@@ -1,0 +1,52 @@
+import { equals, starts_with, len } from strings::std;
+import { linf_eprintln } from "console.fin";
+
+namespace linf {
+
+pub struct CliArgs {
+    format <string> = "contract",
+    compiler <string> = "finc",
+    paths <[string]>,
+    count <int> = 0,
+    ok <bool> = true,
+    display <int> = 0,
+}
+
+// Paths borrow the process's main(args) strings; only the array is owned.
+pub fun free_cli(args: CliArgs) <noret> { delete args.paths; }
+
+pub fun parse_cli(words: [string]) <CliArgs> {
+    let args <CliArgs> = CliArgs{paths: new [string, words.length]{}};
+    let command <bool> = false;
+    let positional <bool> = false;
+    let total <long> = cast<long>(0);
+    if (words.length > 4096) { args.ok = false; linf_eprintln("linf: too many arguments"); return args; }
+    for (let i <int> = 0; i < words.length; i++) {
+        if (words[i] == null) { args.ok = false; linf_eprintln("linf: null argument"); return args; }
+        total += cast<long>(len(words[i]));
+    }
+    if (total > cast<long>(1048576)) { args.ok = false; linf_eprintln("linf: argument bytes exceed 1 MiB"); return args; }
+    for (let i <int> = 0; i < words.length; i++) {
+        let word <string> = words[i];
+        if (!positional && (equals(word, "--help") || equals(word, "-h"))) { args.display = 1; return args; }
+        if (!positional && (equals(word, "--version") || equals(word, "-v"))) { args.display = 2; return args; }
+        if (!positional && equals(word, "--")) { positional = true; continue; }
+        if (!positional && (equals(word, "--format") || equals(word, "-f") || equals(word, "--finc"))) {
+            if (i + 1 >= words.length) { args.ok = false; linf_eprintln("linf: missing value for option"); return args; }
+            let value <string> = words[i + 1];
+            if (equals(word, "--finc")) { args.compiler = value; }
+            else { args.format = value; }
+            i++; continue;
+        }
+        if (!positional && starts_with(word, "-") && !equals(word, "-")) {
+            args.ok = false; linf_eprintln("linf: unknown option"); return args;
+        }
+        if (!command) {
+            if (!equals(word, "check")) { args.ok = false; linf_eprintln("linf: unknown command"); return args; }
+            command = true; continue;
+        }
+        args.paths[args.count] = word; args.count++;
+    }
+    return args;
+}
+}
