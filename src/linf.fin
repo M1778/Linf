@@ -1,3 +1,26 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/linf
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of linf, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
 // linf.fin — the linf v0 binary. See ../RFC.md for the rulings this implements.
 //
 // THE ARCHITECTURE (RFC §1, non-negotiable): finc is the source of truth. For
@@ -26,14 +49,29 @@
 
 import { read_to_string, free_file_content } from fs::std;
 import { ProcessResult, exec_command, free_process_result } from process::std;
-import { Command, Match, Outcome, free_match } from cli::std;
+import { Command, Match, Outcome, free_match, get_env_or } from cli::std;
 import { CdkTokens, cdk_scan, free_cdk_tokens } from cdk::std;
 import { tok_ident, tok_semicolon, tok_lbracket, tok_rbracket, tok_rparen,
+      tok_lbrace, tok_rbrace,
       tok_int_lit, tok_float_lit, tok_string_lit, tok_char_lit,
-      kw_import, kw_from, kw_new, kw_delete, kw_blame } from token::std;
-import { len, to_chars, from_chars, equals, concat, clone, free_str } from strings::std;
+      kw_import, kw_from, kw_as, kw_new, kw_delete, kw_blame } from token::std;
+import { len, to_chars, from_chars, equals, concat, clone, free_str, replace } from strings::std;
 import { json_encode_str, json_decode_str } from json::std;
-import { cli_dprintf } from cli::std;
+
+// `dprintf` to a chosen fd, declared here rather than imported.
+//
+// `cli::std` used to export `cli_dprintf` and stopped in `cc7f166` ("prepare v1 production
+// candidate"), which replaced it with a stdout-only `cli_printf`. Linf writes its warnings and
+// its JSONL to stderr -- the contract reserves stdout -- so a stdout-only helper is not a
+// substitute.
+//
+// lib/std/stdio.fin names this exact route in its own header: "a stderr extern *is*
+// reachable: `dprintf(2, ...)` is one `@define` away and it goes to fd 2 -- verified by
+// running a linked program and redirecting each stream separately." That is what this is.
+// Declaring it locally is the supported pattern; asking the library to grow a second printf
+// family for one consumer would not be.
+#[llvm_name="dprintf"]
+@define cli_dprintf(fd: int, fmt: string, ...) <int>;
 
 // A finding in the contract's field set, renderer-agnostic: linf-owned
 // findings carry `code` ("linf:<rule>"); finc-sourced ones do not, because
@@ -119,12 +157,14 @@ priv fun sev_map(sev_text: string) <int> {
 
 // ---- JSONL field extraction (RFC §2 source 3: bounded key-anchored reads) --
 
-// Index of `key` inside bytes[0..end), or -1. Keys are literals so the
-// compare is a char walk; nothing is allocated.
-priv fun find_in(b: [char], end: int, key: string) <int> {
+// Index of `key` inside bytes[start..end), or -1. Keys are literals so the
+// compare is a char walk; nothing is allocated. The range is the LINE's
+// range: a key is only ever read out of the line that carries it, so one
+// line's values can never leak into the next.
+priv fun find_in(b: [char], start: int, end: int, key: string) <int> {
     let kc <[char]> = to_chars(key);
     let klen <int> = len(key);
-    let i <int> = 0;
+    let i <int> = start;
     while (i + klen <= end) {
         let j <int> = 0;
         let hit <int> = 1;
@@ -148,14 +188,22 @@ priv fun find_in(b: [char], end: int, key: string) <int> {
 
 // The value of `"key":"...."` as a real string: slice the RAW span (opening
 // quote through the escape-aware closing quote) and let json_decode_str own
-// the unescaping. Absent or malformed → "". Caller frees.
-priv fun span_val(b: [char], end: int, key: string) <string> {
-    let hit <int> = find_in(b, end, key);
-    if (hit < 0) { return ""; }
+// the unescaping. Absent, null, or malformed → "". The answer is ALWAYS
+// owned (a fresh empty string when there is none) — the caller frees it.
+priv fun span_val(b: [char], start: int, end: int, key: string) <string> {
+    let hit <int> = find_in(b, start, end, key);
+    if (hit < 0) { return clone(""); }
     let i <int> = hit + len(key);
-    while (i < end && b[i] != '"') { i = i + 1; } // skip to the opening quote
-    if (i >= end) { return ""; }
-    let start <int> = i;
+    while (i < end && b[i] != ':') { i = i + 1; }
+    if (i >= end) { return clone(""); }
+    i = i + 1;
+    while (i < end && b[i] == ' ') { i = i + 1; }
+    if (i >= end) { return clone(""); }
+    // A null (or any non-string) value has no string span. The contract
+    // writes `"file":null`; scanning past it would steal the NEXT key's
+    // value and render a diagnostic under a filename that is not there.
+    if (b[i] != '"') { return clone(""); }
+    let q0 <int> = i;
     i = i + 1;
     let closed <int> = 0;
     while (i < end && closed == 0) {
@@ -167,18 +215,18 @@ priv fun span_val(b: [char], end: int, key: string) <string> {
             i = i + 1;
         }
     }
-    if (closed == 0) { return ""; }
-    let span <string> = from_chars(b, start, i - start + 1);
+    if (closed == 0) { return clone(""); }
+    let span <string> = from_chars(b, q0, i - q0 + 1);
     let dec <Outcome<string>> = json_decode_str(span);
     free_str(span);
     if (dec.is_ok()) { return dec.value; }
-    return "";
+    return clone("");
 }
 
 // The value of `"key":N` as an int; -1 = absent (callers pick defaults:
 // 0 for counts, 0 for line/col).
-priv fun span_int(b: [char], end: int, key: string) <int> {
-    let hit <int> = find_in(b, end, key);
+priv fun span_int(b: [char], start: int, end: int, key: string) <int> {
+    let hit <int> = find_in(b, start, end, key);
     if (hit < 0) { return -1; }
     let i <int> = hit + len(key);
     while (i < end && b[i] != ':') { i = i + 1; }
@@ -218,31 +266,36 @@ priv fun chew_bytes(run: &Run, b: [char], end: int, contract_mode: int) <noret> 
         }
 
         let is_sum <int> = 0;
-        if (find_in(b, e, summary_key) >= 0) { is_sum = 1; }
+        if (find_in(b, start, e, summary_key) >= 0) { is_sum = 1; }
 
         if (is_sum == 1) {
-            let errs <int> = span_int(b, e, "\"errors\"");
-            let warns <int> = span_int(b, e, "\"warnings\"");
+            let errs <int> = span_int(b, start, e, "\"errors\"");
+            let warns <int> = span_int(b, start, e, "\"warnings\"");
             if (errs > 0) { run.finc_errors = run.finc_errors + errs; }
             if (warns > 0) { run.finc_warnings = run.finc_warnings + warns; }
             // finc's OWN summary is the authoritative exit (contract):
             // this is how "finished cleanly" vs "died" is known without
             // trusting the popen waitstatus.
-            let finc_code <int> = span_int(b, e, "\"exitCode\"");
+            let finc_code <int> = span_int(b, start, e, "\"exitCode\"");
             if (finc_code >= 0) { run.worsen(finc_code); }
             run.saw_summary = run.saw_summary + 1;
         } else if (contract_mode != 0) {
-            // contract format: finc's diagnostics forward VERBATIM (unknown
-            // kinds intact); linf's additions render after the run.
-            let raw <string> = from_chars(b, start, e - start);
-            cli_dprintf(2, "%s\n", raw);
-            free_str(raw);
-        } else if (find_in(b, e, diag_key) >= 0) {
-            let sev <string> = span_val(b, e, "\"severity\"");
-            let msg <string> = span_val(b, e, "\"message\"");
-            let file <string> = span_val(b, e, "\"file\"");
-            let ln <int> = span_int(b, e, "\"line\"");
-            let cl <int> = span_int(b, e, "\"column\"");
+            // contract format: finc's lines forward VERBATIM (unknown
+            // kinds intact); linf's additions render after the run. Only
+            // JSONL is contract, so anything else the shell spilled into
+            // the capture (a missing finc binary, say) stays out of the
+            // stream.
+            if (b[start] == '{') {
+                let raw <string> = from_chars(b, start, e - start);
+                cli_dprintf(2, "%s\n", raw);
+                free_str(raw);
+            }
+        } else if (find_in(b, start, e, diag_key) >= 0) {
+            let sev <string> = span_val(b, start, e, "\"severity\"");
+            let msg <string> = span_val(b, start, e, "\"message\"");
+            let file <string> = span_val(b, start, e, "\"file\"");
+            let ln <int> = span_int(b, start, e, "\"line\"");
+            let cl <int> = span_int(b, start, e, "\"column\"");
             let use_ln <int> = ln;
             if (use_ln < 0) { use_ln = 0; }
             let use_cl <int> = cl;
@@ -290,11 +343,16 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
     let l <CdkTokens> = cdk_scan(text);
     let names <[int]> = new [int, 32]{};
     let n_names <int> = 0;
-    let after_semi <int> = -1;
+    // Every token that belongs to an import statement: a name spelled
+    // there is the import itself, never a use of it.
+    let imp_tok <[int]> = new [int, l.count]{};
     let has_delete <int> = 0;
     let has_new <int> = 0;
     let first_delete_line <int> = 0;
-    let state <int> = 0; // 0 outside, 1 between import and from, 2 after from
+    // Import states: 0 outside, 1 target, 2 inside the braces, 3 after the
+    // target, 4 after `from`, 5 after `as`.
+    let state <int> = 0;
+    let target <int> = -1;
     let first_index_line <int> = 0;
     let has_blame <int> = 0;
     let j <int> = 0;
@@ -318,17 +376,49 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
                 first_index_line = l.tokens[j].line;
             }
         }
+        if (state != 0) { imp_tok[j] = 1; }
         if (state == 0) {
             if (k == kw_import()) { state = 1; }
         } else if (state == 1) {
-            if (k == kw_from()) {
+            if (k == tok_lbrace()) {
                 state = 2;
-            } else if (k == tok_ident() && n_names < 32) {
+            } else if (k == tok_ident()) {
+                target = j;
+                state = 3;
+            } else {
+                state = 3;
+            }
+        } else if (state == 2) {
+            if (k == tok_ident() && n_names < 32) {
+                names[n_names] = j;
+                n_names = n_names + 1;
+            } else if (k == tok_rbrace()) {
+                state = 3;
+            }
+        } else if (state == 3) {
+            if (k == kw_from()) {
+                state = 4;
+            } else if (k == kw_as()) {
+                state = 5;
+            } else if (k == tok_semicolon()) {
+                // `import name;` — the module name is the imported name.
+                if (target >= 0 && n_names < 32) {
+                    names[n_names] = target;
+                    n_names = n_names + 1;
+                }
+                target = -1;
+                state = 0;
+            }
+        } else if (state == 4) {
+            if (k == tok_semicolon()) { target = -1; state = 0; }
+        } else {
+            // after `as`: the alias is the imported name, not the module.
+            if (k == tok_ident() && n_names < 32) {
                 names[n_names] = j;
                 n_names = n_names + 1;
             }
-        } else {
-            if (k == tok_semicolon()) { after_semi = j; state = 0; }
+            target = -1;
+            state = 3;
         }
         j = j + 1;
     }
@@ -346,9 +436,13 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
     while (idx < n_names) {
         let ni <int> = names[idx];
         let used <int> = 0;
-        let m <int> = after_semi + 1;
+        // The whole file counts as the use scan: a name used BEFORE its
+        // import (or between two imports) is used all the same. Only the
+        // import statement's own tokens are excluded — there a name is
+        // spelled as the import, not as a use.
+        let m <int> = 0;
         while (m < l.count) {
-            if (l.tokens[m].kind == tok_ident()
+            if (imp_tok[m] == 0 && l.tokens[m].kind == tok_ident()
                 && equals(l.tokens[ni].text, l.tokens[m].text)) {
                 used = 1;
             }
@@ -364,6 +458,7 @@ priv fun lint_source(run: &Run, path: string, text: string) <noret> {
         idx = idx + 1;
     }
     delete names;
+    delete imp_tok;
 
     free_cdk_tokens(l);
 }
@@ -447,6 +542,31 @@ priv fun write_sarif(run: &Run, version: string) <noret> {
     cli_dprintf(2, "]}]}\n");
 }
 
+// ---- the process plumbing ---------------------------------------------------
+
+// POSIX single-quoting for the `sh -c` command line: wrap in ' and spell an
+// embedded ' as '\''. Nothing the caller passes (a path, a --finc value)
+// can step out of the quotes.
+priv fun sh_quote(s: string) <string> {
+    let body <string> = replace(s, "'", "'\\''");
+    let out <string> = concat("'", body);
+    let quoted <string> = concat(out, "'");
+    free_str(body);
+    free_str(out);
+    return quoted;
+}
+
+// pclose's raw wait status decoded into an exit code. The status is
+// 256×rc, and a child that died by signal leaves the low byte set; the
+// shell in between reports such a death as 128+n, so both shapes are read.
+priv fun decode_wait(st: int) <int> {
+    let code <int> = st / 256;
+    let rem <int> = st - code * 256;
+    if (rem != 0) { return 3; }
+    if (code >= 128) { return 3; }
+    return code;
+}
+
 // ---- main --------------------------------------------------------------------
 
 fun main() <int> {
@@ -484,7 +604,23 @@ fun main() <int> {
         return 2;
     }
 
-    let finc_bin <string> = m.get("finc");
+    let finc_bin_param <string> = m.get("finc");
+    // `-` is the declared default and means "find one", which the CLI library cannot do
+    // itself. Without this the command run is `- --diagnostics=json ...`, sh fails to
+    // execute a program called `-`, nothing reaches the read pipe, and every invocation
+    // reports `linf:plumbing: finc produced no summary line` -- a linter that blames the
+    // compiler for not being found.
+    //
+    // `FIN_COMPILER_PATH` is honoured first because that is the variable every other Fin
+    // tool uses, then a bare `finc` resolved by the shell.
+    let finc_bin <string> = finc_bin_param;
+    if (equals(finc_bin, "-")) {
+        // `get_env_or` returns its default as-is when the variable is unset -- it does not
+        // clone -- so freeing the result would free a literal. Cloning unconditionally and
+        // never freeing the borrowed default is the shape that cannot go wrong here.
+        let from_env <string> = get_env_or("FIN_COMPILER_PATH", "finc");
+        finc_bin = clone(from_env);
+    }
     if (m.pos_count <= 0) {
         cli_dprintf(2, "linf: no paths given\n");
         free_match(m);
@@ -498,14 +634,20 @@ fun main() <int> {
         let path <string> = m.pos[pi];
 
         // finc is the source of truth (RFC §1). The capture merges stderr
-        // into the read pipe: finc's stdout is contract-silent here.
-        let base <string> = concat(finc_bin, " \"");
-        let one <string> = concat(base, path);
-        free_str(base);
-        let two <string> = concat(one, "\" --diagnostics=json --color=never 2>&1");
-        free_str(one);
-        let res <ProcessResult> = exec_command(two);
-        free_str(two);
+        // into the read pipe: finc's stdout is contract-silent here. The
+        // binary and the path are shell-quoted: `sh -c` would otherwise
+        // run whatever they spell.
+        let qbin <string> = sh_quote(finc_bin);
+        let qpath <string> = sh_quote(path);
+        let cmd1 <string> = concat(qbin, " ");
+        let cmd2 <string> = concat(cmd1, qpath);
+        let cmd3 <string> = concat(cmd2, " --diagnostics=json --color=never 2>&1");
+        free_str(qbin);
+        free_str(qpath);
+        free_str(cmd1);
+        free_str(cmd2);
+        let res <ProcessResult> = exec_command(cmd3);
+        free_str(cmd3);
 
         if (res.exit_code == -1) {
             run.add(2, "linf:plumbing", "could not run the finc binary", path, 0, 0);
@@ -522,27 +664,23 @@ fun main() <int> {
             delete usable;
 
             // No summary this path: finc died before reporting. The popen
-            // waitstatus decodes as the fallback (low byte nonzero = signal
-            // kill = compiler failure; shell 127-normalized = plumbing).
+            // waitstatus decodes as the fallback: a signal death is a finc
+            // failure (3), anything else is plumbing (2).
             if (run.saw_summary == saw_before) {
-                let st <int> = res.exit_code;
-                let high <int> = st / 256;
-                let rem <int> = st - high * 256;
-                if (rem != 0) {
+                let d <int> = decode_wait(res.exit_code);
+                if (d == 3) {
                     run.worsen(3);
                 } else {
-                    run.worsen(high);
+                    run.worsen(2);
                 }
             }
 
-            // The rules (RFC §4) only when the source itself is readable; an
-            // unreadable path already reached finc (its exit 2 propagates).
-            if (res.exit_code != 2) {
-                let src? <string> = read_to_string(path);
-                if (src != null) {
-                    lint_source(&run, path, src?);
-                    free_file_content(src);
-                }
+            // The rules (RFC §4) run whenever the source itself is readable;
+            // an unreadable path fails the read itself.
+            let src? <string> = read_to_string(path);
+            if (src != null) {
+                lint_source(&run, path, src?);
+                free_file_content(src);
             }
         }
         free_process_result(res);
@@ -558,8 +696,10 @@ fun main() <int> {
         run.worsen(2);
     }
 
-    // Findings worsen the exit per the mirror: anything user-facing fires 1.
-    if (run.count > 0 && run.linf_exit == 0) {
+    // Findings worsen the exit per the mirror: linf's OWN findings fire 1.
+    // A finc warning is not a linf finding (finc's own exit already rides
+    // in through its summary), so every lane reads the same exit.
+    if (run.linf_count > 0 && run.linf_exit == 0) {
         run.linf_exit = 1;
     }
 
