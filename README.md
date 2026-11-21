@@ -29,4 +29,4 @@ binary is real and shipped in this repo, written **in Fin** against the
   `finfmt --check`'s exit code is drift-truthful (RFC §4 records the probe).
 - **Contract** — plumbing pinned to the finc machine contract v3
   (`kFincContractVersion`); `VERSION` major tracks it, same policy as
-  `fin-sdk` (currently 3.0.0).
+  `fin-sdk` (currently 3.3.0).

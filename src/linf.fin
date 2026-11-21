@@ -76,6 +76,14 @@ import { json_encode_str, json_decode_str } from json::std;
 // A finding in the contract's field set, renderer-agnostic: linf-owned
 // findings carry `code` ("linf:<rule>"); finc-sourced ones do not, because
 // the contract's `code` is null for finc diagnostics today.
+// The one place this version is written down.
+//
+// It used to be a literal at the SARIF call site, and `VERSION` is a separate file, so a
+// release bump meant editing two places and remembering both. The failure is silent: SARIF
+// tools report the stale runtime version while the repository says otherwise, and nothing
+// compares them.
+const LINF_VERSION <string> = "3.1.0";
+
 priv struct Fnd {
     pub sev <int> = 1, // 0 note 1 warning 2 error (diag.fin's levels)
     pub code <string> = "",
@@ -726,7 +734,7 @@ fun main() <int> {
             i = i + 1;
         }
     } else {
-        write_sarif(&run, "3.0.0");
+        write_sarif(&run, LINF_VERSION);
     }
 
     // Exactly one summary — except the SARIF lane, whose document is the

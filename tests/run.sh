@@ -127,4 +127,16 @@ run fixture_ok.fin fixture_bad.fin fixture_linted.fin
 grep -qF '"errors":1,"warnings":3,"exitCode":1' "$OUT" && pass "multi-totals" || defy "multi-totals"
 
 rm -f "$OUT" "$HERE/.stdout" "$BIN"
+# The version is written down twice: VERSION, which is what a release reads, and
+# LINF_VERSION in src/linf.fin, which is what the SARIF output reports. They are compared
+# here because a mismatch is silent -- SARIF consumers would report a stale version while the
+# repository said otherwise.
+file_version="$(cat "$HERE/../VERSION" 2>/dev/null | tr -d ' \n')"
+src_version="$(sed -n 's/^const LINF_VERSION <string> = "\([0-9.]*\)";/\1/p' "$HERE/../src/linf.fin")"
+if [ -n "$file_version" ] && [ "$file_version" = "$src_version" ]; then
+  pass "version-in-step"
+else
+  defy "version-in-step: VERSION=$file_version src=$src_version"
+fi
+
 if [ "$FAIL" -eq 0 ]; then echo "ALL LINF SELF-CHECKS PASS"; else echo "LINF SELF-CHECK FAILURES"; exit 1; fi
